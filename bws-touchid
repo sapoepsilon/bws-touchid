@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""bws-touchid: Touch ID per access for Bitwarden Secrets Manager machine tokens.
+
+Tokens are age-encrypted to a Secure Enclave identity (age-plugin-se, Touch ID access control).
+Every use decrypts the token, so the Secure Enclave asks for Touch ID every time. A small broker
+(launchd user agent) does the decrypting and runs `bws` on this Mac; local and ssh-forwarded
+clients only ever get results, never the token.
+
+Commands (also reachable through the bws-save / bws-gated symlinks):
+  bws-touchid init [--access-control any-biometry]   create the Secure Enclave identity
+  bws-touchid store NAME [--stdin]                    encrypt a token (hidden prompt; no Touch ID needed)
+  bws-touchid status                                  identity, stored token names, broker reachability
+  bws-touchid delete NAME                             remove an encrypted token
+  bws-touchid run [--token NAME] -- CMD...            Touch ID, then exec CMD with BWS_ACCESS_TOKEN set
+  bws-touchid serve                                   the broker (launchd, gui/<uid>)
+  bws-touchid reap                                    delete a dead forwarded socket (remote hosts)
+  bws-save [--project P] [--note N] [--dry-run] KEY   VALUE on stdin -> broker -> bws secret create/edit
+  bws-gated <bws args>                                read-only bws through the broker (drop-in BWS_BIN)
+
+Python 3.9 standard library only. See README.md for the threat model.
+"""
+
+import base64
+import datetime
+import getpass
+import json
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.environ.get("BWS_TOUCHID_HOME") or os.path.join(HOME, ".config", "bws-touchid")
+CONFIG_PATH = os.path.join(CONF_DIR, "config.json")
+IDENTITY = os.path.join(CONF_DIR, "identity.txt")
+RECIPIENT = os.path.join(CONF_DIR, "recipient.txt")
+TOKENS_DIR = os.path.join(CONF_DIR, "tokens")
+SOCK_DIR = os.path.join(HOME, ".bws-broker")
+LOCAL_SOCK = os.path.join(SOCK_DIR, "broker.sock")
+FWD_SOCK = os.path.join(SOCK_DIR, "fwd.sock")
+LOG_PATH = os.path.join(HOME, "Library", "Logs", "bws-touchid.log")
+
+MAX_VALUE = 64 * 1024
+MAX_LINE = 512 * 1024
+MAX_STDOUT = 8 * 1024 * 1024
+KEY_RE = re.compile(r"^[A-Z0-9_]{1,128}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+TOKEN_RE = re.compile(r"^0\.[0-9a-fA-F-]{36}\.[^:\s]+:[A-Za-z0-9+/=]+$")
+SOL_LOCAL, LOCAL_PEERCRED, LOCAL_PEERPID = 0, 0x001, 0x002
+EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local", "bin")]
+
+DEFAULTS = {
+    "broker_name": "the broker Mac",          # shown to agents when the broker is unreachable
+    "read_token": "read",                     # token used by bws-gated / run
+    "write_token": "write",                   # token used by bws-save
+    "save_projects": [],                      # project NAMES bws-save may write; first = default
+    "project_names": {},                      # project id -> name, for readable notifications
+    "denied_projects": [],                    # ids or names never read or written
+    "denied_key_prefixes": [],                # key prefixes never read or written
+    "server_urls": ["https://vault.bitwarden.com", "https://vault.bitwarden.eu"],
+    "bws_path": "",                           # default: first bws on PATH / common locations
+    "age_path": "",
+    "notify": True,                           # macOS notification before every decrypt
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def die(msg, code=1):
+    eprint("bws-touchid: " + msg)
+    sys.exit(code)
+
+
+def clean(s, n=80):
+    s = "".join(ch for ch in str(s or "") if ch.isprintable())
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def load_config():
+    c = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(CONFIG_PATH) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            c.update({k: v for k, v in user.items() if not k.startswith("_")})
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        eprint("bws-touchid: ignoring unreadable config %s: %s" % (CONFIG_PATH, e))
+    c["denied_projects"] = [str(x).lower() for x in c.get("denied_projects") or []]
+    names = {str(k).lower(): str(v) for k, v in (c.get("project_names") or {}).items()}
+    c["project_names"] = names
+    for pid, nm in names.items():  # denying a name also denies its id
+        if nm.lower() in c["denied_projects"]:
+            c["denied_projects"].append(pid)
+    c["save_projects"] = [p for p in c.get("save_projects") or [] if p.lower() not in c["denied_projects"]]
+    return c
+
+
+def denied_project(x, c):
+    return str(x or "").lower() in c["denied_projects"]
+
+
+def denied_key(k, c):
+    return any(p and str(k).startswith(p) for p in c.get("denied_key_prefixes") or [])
+
+
+def log(fields):
+    fields = dict(fields)
+    fields["ts"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    order = ["ts", "op", "result", "key", "project", "token", "host", "caller", "via", "detail"]
+    line = " ".join("%s=%s" % (k, clean(fields[k], 200)) for k in order if fields.get(k)) + "\n"
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(line)
+
+
+def find_tool(name, configured):
+    if configured:
+        return configured
+    path = os.pathsep.join([os.environ.get("PATH", "")] + EXTRA_PATH)
+    return shutil.which(name, path=path)
+
+
+def tool_env():
+    return {"PATH": os.pathsep.join(EXTRA_PATH + ["/usr/bin", "/bin"]), "HOME": HOME}
+
+
+def notify(title, msg, c):
+    if not c.get("notify", True):
+        return
+    script = ["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+              "-e", "end run", clean(title, 60), clean(msg, 200)]
+    try:
+        subprocess.run(["/usr/bin/osascript"] + script, timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def token_path(name):
+    if not NAME_RE.match(name or ""):
+        raise ValueError("bad token name")
+    return os.path.join(TOKENS_DIR, name + ".age")
+
+
+def decrypt_token(name, c):
+    """One Secure Enclave decrypt = one Touch ID prompt. Returns (token, error)."""
+    path = token_path(name)
+    if not os.path.isfile(path):
+        return None, "no token named '%s' on the broker Mac (owner: bws-touchid store %s)" % (name, name)
+    age = find_tool("age", c.get("age_path"))
+    if not age:
+        return None, "age not found (brew install age age-plugin-se)"
+    try:
+        r = subprocess.run([age, "-d", "-i", IDENTITY, path], capture_output=True, timeout=120, env=tool_env())
+    except subprocess.TimeoutExpired:
+        return None, "timed out waiting for Touch ID"
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        return None, "Touch ID / decrypt failed: %s" % clean(err[-1] if err else "exit %d" % r.returncode, 160)
+    tok = r.stdout.decode("utf-8").strip()
+    if not tok:
+        return None, "decrypted token is empty"
+    return tok, None
+
+
+def run_bws(args, token, c, timeout=60):
+    """Run bws with the token in env only and an empty HOME (no user bws config can redirect it)."""
+    bws = find_tool("bws", c.get("bws_path"))
+    if not bws:
+        return 127, b"", "bws not found on the broker Mac"
+    with tempfile.TemporaryDirectory(prefix="bws-touchid-") as tmp:
+        env = {"HOME": tmp, "TMPDIR": tmp + "/", "PATH": "/usr/bin:/bin", "BWS_ACCESS_TOKEN": token}
+        try:
+            r = subprocess.run([bws, "--color", "no"] + args, capture_output=True, timeout=timeout,
+                               env=env, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return 124, b"", "bws timed out"
+    err = r.stderr.decode("utf-8", "replace").replace(token, "[REDACTED]")
+    if len(r.stdout) > MAX_STDOUT:
+        return 1, b"", "bws output too large"
+    return r.returncode, r.stdout, err[:600]
+
+
+# ------------------------------------------------------- who is asking
+
+def ps_field(pid, field):
+    try:
+        r = subprocess.run(["/bin/ps", "-o", field + "=", "-p", str(pid)], capture_output=True, timeout=3)
+        return r.stdout.decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def proc_label(pid):
+    args = ps_field(pid, "args").split()
+    if not args:
+        return "pid%s" % pid
+    base = os.path.basename(args[0]).lstrip("-")
+    if base in ("bash", "zsh", "sh") and "-c" in args:
+        return base + " -c"
+    if base in ("node", "bun", "deno", "bash", "zsh", "sh", "perl", "ruby", "env") or base.startswith("python"):
+        for a in args[1:]:
+            if not a.startswith("-"):
+                return "%s %s" % (base, "/".join(a.split("/")[-2:]))
+    return base
+
+
+def proc_chain(pid, depth=4):
+    out = []
+    for _ in range(depth):
+        try:
+            pid = int(pid)
+        except ValueError:
+            break
+        if pid <= 1:
+            break
+        out.append(proc_label(pid))
+        pid = ps_field(pid, "ppid") or "0"
+    return " < ".join(out)
+
+
+def ssh_destination(args):
+    """Destination of an ssh client argv, never the remote command (which could hold a value)."""
+    with_arg = set("-" + ch for ch in "BbcDEeFIiJLlmOoPpQRSWw")
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return args[i + 1] if i + 1 < len(args) else "?"
+        if a.startswith("-"):
+            i += 2 if a in with_arg else 1
+            continue
+        return a
+    return "?"
+
+
+# ---------------------------------------------------------------- broker
+
+def validate_read_args(raw, c):
+    pos, server = [], None
+    i = 0
+    while i < len(raw):
+        a = raw[i]
+        if a in ("--color", "-c"):
+            i += 2
+        elif a in ("--output", "-o"):
+            if i + 1 >= len(raw) or raw[i + 1] != "json":
+                return None
+            i += 2
+        elif a in ("--server-url", "-u"):
+            if i + 1 >= len(raw) or raw[i + 1] not in c["server_urls"]:
+                return None
+            server = raw[i + 1]
+            i += 2
+        elif a.startswith("-"):
+            return None  # -t/--access-token, -f, -p, --value, ... all refused
+        else:
+            pos.append(a)
+            i += 1
+    name = lambda pid: c["project_names"].get(pid.lower(), pid)  # noqa: E731
+    if pos == ["project", "list"]:
+        summary = "list projects"
+    elif pos == ["secret", "list"]:
+        summary = "read ALL secrets the token can see"
+    elif len(pos) == 3 and pos[:2] == ["secret", "list"] and UUID_RE.match(pos[2]):
+        summary = "read all secrets in " + name(pos[2])
+    elif len(pos) == 3 and pos[:2] == ["secret", "get"] and UUID_RE.match(pos[2]):
+        summary = "read secret %s…" % pos[2][:8]
+    elif len(pos) == 3 and pos[:2] == ["project", "get"] and UUID_RE.match(pos[2]):
+        summary = "get project " + name(pos[2])
+    else:
+        return None
+    if any(denied_project(p, c) for p in pos):
+        return None
+    args = ["--output", "json"] + (["--server-url", server] if server else []) + pos
+    return args, summary
+
+
+def scrub(stdout, c):
+    def bad(e):
+        return (denied_key(e.get("key", ""), c) or denied_project(e.get("projectId"), c)
+                or denied_project(e.get("id"), c) or denied_project(e.get("name"), c))
+    try:
+        data = json.loads(stdout or b"null")
+    except ValueError:
+        return stdout
+    if isinstance(data, list):
+        return json.dumps([e for e in data if not (isinstance(e, dict) and bad(e))]).encode()
+    if isinstance(data, dict) and bad(data):
+        return b"{}"
+    return stdout
+
+
+def handle(req, peer_pid):
+    c = load_config()
+    op = req.get("op", "")
+    host = clean(req.get("host"), 48)
+    caller = clean(req.get("caller"), 60)
+    peer_args = ps_field(peer_pid, "args").split()
+    if peer_args and os.path.basename(peer_args[0]) == "ssh":
+        via = "ssh session to " + clean(ssh_destination(peer_args), 40)
+        who = "%s (%s)" % (host or "remote", caller or "?")
+    else:
+        via = "local: " + clean(proc_chain(ps_field(peer_pid, "ppid") or peer_pid), 70)
+        who = caller or "local process"
+    rec = {"op": op, "host": host, "caller": caller, "via": via}
+    dry = bool(req.get("dryrun"))
+
+    def reject(msg):
+        rec.update(result="rejected", detail=msg)
+        log(rec)
+        return {"ok": False, "error": msg}
+
+    if op == "ping":
+        return {"ok": True, "broker": "bws-touchid", "broker_name": c["broker_name"]}
+
+    if op == "save":
+        key = req.get("key") or ""
+        project = req.get("project") or (c["save_projects"][0] if c["save_projects"] else "")
+        note = req.get("note") or ""
+        value = req.get("value")
+        rec.update(key=key, project=project, token=c["write_token"])
+        if not KEY_RE.match(key):
+            return reject("key must match ^[A-Z0-9_]+$ (max 128)")
+        if denied_key(key, c):
+            return reject("that key prefix is owner-only")
+        if not project or denied_project(project, c) or project not in c["save_projects"]:
+            return reject("project '%s' is not in save_projects %s" % (clean(project, 40), c["save_projects"]))
+        if not isinstance(value, str) or not value:
+            return reject("empty value")
+        if len(value.encode()) > MAX_VALUE:
+            return reject("value larger than %d bytes" % MAX_VALUE)
+        if not isinstance(note, str) or len(note) > 1000:
+            return reject("note longer than 1000 chars")
+        if dry:
+            rec.update(result="DRYRUN-ok")
+            log(rec)
+            return {"ok": True, "id": "dryrun", "action": "dry-run"}
+        notify("Touch ID: save %s" % key, "%s → %s [%s]" % (who, project, via), c)
+        token, err = decrypt_token(c["write_token"], c)
+        if err:
+            rec.update(result="auth-failed", detail=err)
+            log(rec)
+            return {"ok": False, "error": err}
+        code, out, err = run_bws(["--output", "json", "project", "list"], token, c)
+        try:
+            projects = json.loads(out) if code == 0 else None
+        except ValueError:
+            projects = None
+        if not isinstance(projects, list):
+            return reject("bws project list failed: " + err)
+        pid = next((p.get("id") for p in projects if p.get("name") == project), None)
+        if not pid or denied_project(pid, c):
+            return reject("project '%s' is not visible to the write token" % project)
+        code, out, err = run_bws(["--output", "json", "secret", "list", pid], token, c)
+        try:
+            secrets = json.loads(out) if code == 0 else None
+        except ValueError:
+            secrets = None
+        if not isinstance(secrets, list):
+            return reject("bws secret list failed: " + err)
+        existing = [s for s in secrets if s.get("key") == key]
+        if len(existing) > 1:
+            return reject("%d secrets already named %s in %s; fix by hand" % (len(existing), key, project))
+        # bws 2.x only takes the value on argv: it is visible to same-user processes on this Mac
+        # for the second bws runs. Never logged; redacted from errors.
+        if existing:
+            args = ["--output", "json", "secret", "edit", "--value", value]
+            args += ["--note", note] if note else []
+            args.append(existing[0]["id"])
+            action = "updated"
+        else:
+            args = ["--output", "json", "secret", "create", key, value, pid]
+            args += ["--note", note] if note else []
+            action = "created"
+        code, out, err = run_bws(args, token, c)
+        del token
+        if code != 0:
+            rec.update(result="error", detail="bws %s failed exit %d" % (action, code))
+            log(rec)
+            return {"ok": False, "error": "bws failed: " + err.replace(value, "[REDACTED]")}
+        try:
+            sid = json.loads(out).get("id", "")
+        except (ValueError, AttributeError):
+            sid = ""
+        rec.update(result=action, detail="id=%s" % sid)
+        log(rec)
+        return {"ok": True, "id": sid, "action": action, "project": project}
+
+    if op == "bws":
+        raw = req.get("args")
+        tname = req.get("token") or c["read_token"]
+        rec["token"] = tname
+        if not NAME_RE.match(str(tname)):
+            return reject("bad token name")
+        v = validate_read_args(raw, c) if isinstance(raw, list) and all(isinstance(a, str) for a in raw) else None
+        if not v:
+            return reject("refused: only read-only bws calls (project list/get, secret list/get, -o json)")
+        args, summary = v
+        rec["detail"] = summary
+        if dry:
+            rec.update(result="DRYRUN-ok")
+            log(rec)
+            return {"ok": True, "exit": 0, "stdout_b64": base64.b64encode(b"[]").decode()}
+        notify("Touch ID: %s" % summary, "%s [%s]" % (who, via), c)
+        token, err = decrypt_token(tname, c)
+        if err:
+            rec.update(result="auth-failed", detail=err)
+            log(rec)
+            return {"ok": False, "error": err}
+        code, out, err = run_bws(args, token, c)
+        del token
+        rec["result"] = "exit=%d" % code
+        log(rec)
+        return {"ok": code == 0, "exit": code, "stdout_b64": base64.b64encode(scrub(out, c)).decode(),
+                "stderr": err, "error": "" if code == 0 else "bws exited %d" % code}
+
+    return reject("unknown op")
+
+
+def read_line(conn, limit):
+    buf = b""
+    while len(buf) <= limit:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return buf or None
+        nl = chunk.find(b"\n")
+        if nl >= 0:
+            return buf + chunk[:nl]
+        buf += chunk
+    return None
+
+
+def cmd_serve(_argv):
+    os.umask(0o077)
+    os.makedirs(SOCK_DIR, exist_ok=True)
+    os.chmod(SOCK_DIR, 0o700)
+    try:
+        os.unlink(LOCAL_SOCK)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(LOCAL_SOCK)
+    os.chmod(LOCAL_SOCK, 0o600)
+    srv.listen(16)
+    log({"op": "serve", "result": "listening", "detail": LOCAL_SOCK})
+    while True:  # serial on purpose: one Touch ID prompt at a time
+        conn, _ = srv.accept()
+        try:
+            cred = conn.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, 76)
+            peer_uid = struct.unpack_from("Ii", cred)[1]
+            peer_pid = struct.unpack("i", conn.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4))[0]
+            if peer_uid != os.getuid():
+                resp = {"ok": False, "error": "peer uid mismatch"}
+            else:
+                conn.settimeout(15)
+                line = read_line(conn, MAX_LINE)
+                try:
+                    req = json.loads(line) if line else None
+                except ValueError:
+                    req = None
+                if not isinstance(req, dict):
+                    resp = {"ok": False, "error": "bad request (one JSON line)"}
+                else:
+                    conn.settimeout(150)
+                    resp = handle(req, peer_pid)
+                    req.clear()
+            conn.sendall(json.dumps(resp).encode() + b"\n")
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass  # status probes and clients that gave up
+        except Exception as e:  # noqa: BLE001
+            log({"op": "serve", "result": "error", "detail": type(e).__name__})
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------- client
+
+def not_connected(c):
+    return ("bws broker not reachable: this shell is not connected from %s.\n"
+            "Bitwarden SM access needs the owner's Touch ID on that Mac, through an ssh session opened\n"
+            "FROM it (RemoteForward to ~/.bws-broker/fwd.sock). Ask the owner to connect, or to store\n"
+            "the value himself. Nothing was sent." % c["broker_name"])
+
+
+def broker_call(req):
+    c = load_config()
+    # Inside an ssh session, the broker of the Mac that opened it (forwarded socket) wins;
+    # otherwise this Mac's own broker, if it has one. BWS_BROKER_SOCK overrides both.
+    order = [FWD_SOCK, LOCAL_SOCK] if os.environ.get("SSH_CONNECTION") else [LOCAL_SOCK, FWD_SOCK]
+    candidates = [os.environ.get("BWS_BROKER_SOCK")] + order
+    s = None
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(p)
+            break
+        except OSError:
+            s.close()
+            s = None
+    if s is None:
+        die(not_connected(c), 3)
+    try:
+        s.settimeout(160)
+        s.sendall(json.dumps(req).encode() + b"\n")
+        line = read_line(s, MAX_STDOUT * 2)
+    except OSError as e:
+        die("broker connection failed: %s" % e, 4)
+    finally:
+        s.close()
+    try:
+        return json.loads(line)
+    except (TypeError, ValueError):
+        die("no answer from the broker (timed out or died)", 4)
+
+
+def my_caller():
+    return clean(os.environ.get("BWS_TOUCHID_CALLER") or proc_chain(os.getppid(), 2), 60)
+
+
+def read_value(prompt):
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    data = sys.stdin.buffer.read(MAX_VALUE + 3)
+    if len(data) > MAX_VALUE + 2:
+        die("value larger than %d bytes" % MAX_VALUE)
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    if data.endswith(b"\r"):
+        data = data[:-1]
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        die("value is not UTF-8")
+
+
+def cmd_save(argv):
+    project = note = key = ""
+    dry = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--project", "--note") and i + 1 < len(argv):
+            if a == "--project":
+                project = argv[i + 1]
+            else:
+                note = argv[i + 1]
+            i += 2
+        elif a == "--dry-run":
+            dry, i = True, i + 1
+        elif a in ("-h", "--help"):
+            print('usage: printf %s "$VALUE" | bws-save [--project NAME] [--note TEXT] [--dry-run] KEY')
+            sys.exit(0)
+        elif a.startswith("-"):
+            die("unknown option " + a, 2)
+        elif key:
+            die("only one KEY; the value goes on stdin, never argv", 2)
+        else:
+            key, i = a, i + 1
+    if not KEY_RE.match(key):
+        die("KEY must match ^[A-Z0-9_]+$", 2)
+    value = read_value("Value for %s (hidden): " % key)
+    if not value:
+        die("empty value on stdin", 2)
+    req = {"op": "save", "key": key, "value": value, "host": socket.gethostname().split(".")[0],
+           "caller": my_caller(), "dryrun": dry}
+    if project:
+        req["project"] = project
+    if note:
+        req["note"] = note
+    eprint("bws-save: waiting for the owner's Touch ID on %s…" % load_config()["broker_name"])
+    r = broker_call(req)
+    if r.get("ok"):
+        print("ok %s %s id=%s" % (r.get("action", "saved"), key, r.get("id", "")))
+        sys.exit(0)
+    die("refused: " + str(r.get("error")), 5)
+
+
+def cmd_gated(argv):
+    req = {"op": "bws", "args": argv, "host": socket.gethostname().split(".")[0], "caller": my_caller(),
+           "dryrun": os.environ.get("BWS_BROKER_DRYRUN") == "1"}
+    if os.environ.get("BWS_TOUCHID_TOKEN"):
+        req["token"] = os.environ["BWS_TOUCHID_TOKEN"]
+    r = broker_call(req)
+    out = base64.b64decode(r.get("stdout_b64") or "")
+    sys.stdout.buffer.write(out)
+    sys.stdout.flush()
+    if r.get("stderr"):
+        eprint(r["stderr"])
+    if not r.get("ok"):
+        eprint("bws-gated: " + str(r.get("error") or "failed"))
+        sys.exit(r.get("exit") or 5)
+    sys.exit(0)
+
+
+# ------------------------------------------------------- local admin
+
+def cmd_init(argv):
+    ac = "any-biometry"
+    if "--access-control" in argv:
+        ac = argv[argv.index("--access-control") + 1]
+    os.makedirs(TOKENS_DIR, exist_ok=True)
+    os.chmod(CONF_DIR, 0o700)
+    os.chmod(TOKENS_DIR, 0o700)
+    if os.path.exists(IDENTITY):
+        print("identity exists: %s" % IDENTITY)
+    else:
+        plugin = find_tool("age-plugin-se", "")
+        if not plugin:
+            die("age-plugin-se not found (brew install age age-plugin-se)")
+        subprocess.run([plugin, "keygen", "--access-control", ac, "-o", IDENTITY], check=True,
+                       stdout=subprocess.DEVNULL)
+        os.chmod(IDENTITY, 0o600)
+        print("created Secure Enclave identity (%s): %s" % (ac, IDENTITY))
+    plugin = find_tool("age-plugin-se", "")
+    subprocess.run([plugin, "recipients", "-i", IDENTITY, "-o", RECIPIENT], check=True)
+    os.chmod(RECIPIENT, 0o600)
+    print("recipient: %s" % open(RECIPIENT).read().strip())
+
+
+def cmd_store(argv):
+    names = [a for a in argv if not a.startswith("-")]
+    if len(names) != 1 or not NAME_RE.match(names[0]):
+        die("usage: bws-touchid store NAME [--stdin]   (NAME like read, write)", 2)
+    name = names[0]
+    if not os.path.exists(RECIPIENT):
+        die("no identity yet: run bws-touchid init")
+    if "--stdin" in argv:
+        if sys.stdin.isatty():
+            die("--stdin expects a pipe")
+        token = read_value("")
+    else:
+        token = getpass.getpass("Paste the Bitwarden SM access token for '%s' (hidden): " % name)
+    token = token.strip()
+    if not TOKEN_RE.match(token):
+        die("that does not look like a bws access token (0.<uuid>.<secret>:<key>); nothing stored")
+    age = find_tool("age", load_config().get("age_path"))
+    if not age:
+        die("age not found (brew install age age-plugin-se)")
+    os.makedirs(TOKENS_DIR, exist_ok=True)
+    dest = token_path(name)
+    tmp = dest + ".tmp"
+    old = os.umask(0o077)
+    try:
+        r = subprocess.run([age, "-R", RECIPIENT, "-o", tmp], input=token.encode(), env=tool_env(),
+                           capture_output=True)
+    finally:
+        os.umask(old)
+    del token
+    if r.returncode != 0:
+        die("age encrypt failed: " + r.stderr.decode("utf-8", "replace")[:200])
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dest)
+    log({"op": "store", "result": "ok", "token": name})
+    print("stored token '%s' -> %s (decrypting it needs Touch ID)" % (name, dest))
+
+
+def cmd_delete(argv):
+    if len(argv) != 1:
+        die("usage: bws-touchid delete NAME", 2)
+    p = token_path(argv[0])
+    if os.path.exists(p):
+        os.remove(p)
+        log({"op": "delete", "result": "ok", "token": argv[0]})
+        print("deleted %s" % p)
+    else:
+        print("no token named %s" % argv[0])
+
+
+def cmd_status(_argv):
+    c = load_config()
+    print("identity:  %s" % (IDENTITY if os.path.exists(IDENTITY) else "absent (client-only host)"))
+    toks = sorted(f[:-4] for f in os.listdir(TOKENS_DIR) if f.endswith(".age")) if os.path.isdir(TOKENS_DIR) else []
+    print("tokens:    %s" % (", ".join(toks) or "none"))
+    reach = "unreachable"
+    for p in (LOCAL_SOCK, FWD_SOCK):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(p)
+            reach = "reachable at " + p
+            break
+        except OSError:
+            pass
+        finally:
+            s.close()
+    print("broker:    %s (%s)" % (reach, c["broker_name"]))
+    print("config:    %s" % (CONFIG_PATH if os.path.exists(CONFIG_PATH) else "defaults"))
+    print("log:       %s" % LOG_PATH)
+
+
+def cmd_run(argv):
+    c = load_config()
+    name = c["read_token"]
+    if "--token" in argv[: argv.index("--") if "--" in argv else len(argv)]:
+        name = argv[argv.index("--token") + 1]
+    if "--" not in argv or argv.index("--") == len(argv) - 1:
+        die("usage: bws-touchid run [--token NAME] -- CMD ARGS...", 2)
+    cmd = argv[argv.index("--") + 1:]
+    shown = clean(" ".join(cmd), 60)
+    notify("Touch ID: run with token '%s'" % name, "%s [%s]" % (shown, clean(proc_chain(os.getppid(), 2), 50)), c)
+    token, err = decrypt_token(name, c)
+    if err:
+        die(err)
+    log({"op": "run", "result": "exec", "token": name, "caller": proc_chain(os.getppid(), 2),
+         "detail": os.path.basename(cmd[0])})
+    env = dict(os.environ)
+    env["BWS_ACCESS_TOKEN"] = token
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as e:
+        die("exec %s failed: %s" % (cmd[0], e), 127)
+
+
+def cmd_reap(_argv):
+    if not os.path.exists(FWD_SOCK):
+        return
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(FWD_SOCK)
+    except ConnectionRefusedError:
+        os.unlink(FWD_SOCK)
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def main():
+    prog = os.path.basename(sys.argv[0])
+    argv = sys.argv[1:]
+    if prog == "bws-save":
+        return cmd_save(argv)
+    if prog == "bws-gated":
+        return cmd_gated(argv)
+    cmds = {"init": cmd_init, "store": cmd_store, "status": cmd_status, "delete": cmd_delete,
+            "run": cmd_run, "serve": cmd_serve, "reap": cmd_reap, "save": cmd_save, "gated": cmd_gated}
+    if not argv or argv[0] not in cmds:
+        print(__doc__.strip())
+        sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
+    return cmds[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main()
