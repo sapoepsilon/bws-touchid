@@ -478,7 +478,7 @@ def cmd_serve(_argv):
                     resp = handle(req, peer_pid)
                     req.clear()
             conn.sendall(json.dumps(resp).encode() + b"\n")
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        except (OSError, socket.timeout):
             pass  # status probes and clients that gave up
         except Exception as e:  # noqa: BLE001
             log({"op": "serve", "result": "error", "detail": type(e).__name__})
