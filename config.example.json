@@ -1,5 +1,5 @@
 {
-  "_comment": "~/.config/bws-touchid/config.json. On client-only hosts only broker_name is used.",
+  "_comment": "~/.config/bws-touchid/config.json. On client-only hosts only broker_name and local_broker are used.",
   "broker_name": "Alice's MacBook",
   "read_token": "read",
   "write_token": "write",
@@ -7,5 +7,6 @@
   "project_names": { "00000000-0000-0000-0000-000000000000": "agents" },
   "denied_projects": ["owner-only"],
   "denied_key_prefixes": ["OWNER_"],
-  "notify": true
+  "notify": true,
+  "tunnels": ["other-mac", { "host": "build-box", "remote_sock": "/Users/builder/.bws-broker/fwd.sock" }]
 }

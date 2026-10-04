@@ -23,8 +23,9 @@ ever holding the token.
 - `bws-gated` is a drop-in `bws` for read-only calls (`project list|get`, `secret list|get`, `-o json`).
   Point anything that takes a `BWS_BIN` at it. Other flags (`--access-token`, `--config-file`, unknown
   `--server-url`, write subcommands) are refused.
-- Remote Macs: add a `RemoteForward` from the broker Mac's ssh config, and agents in those ssh sessions
-  reach your broker through `~/.bws-broker/fwd.sock` on the remote. They get results, never the token.
+- Remote Macs reach your broker through `~/.bws-broker/fwd.sock` on the remote, carried either by a
+  persistent tunnel from the broker Mac (`bws-touchid tunnel install`) or by a `RemoteForward` in your
+  interactive ssh sessions. They get results, never the token.
 
 Every request is logged to `~/Library/Logs/bws-touchid.log`: operation, key name, project, claimed host
 and caller, and the process that actually connected (`via=local: ...` with its parent chain, or
@@ -55,7 +56,48 @@ bws-touchid run -- bws secret list          # local only: token in that command'
 ./install-remote.sh other-mac --reaper            # or --sshd-unlink if it has passwordless sudo
 ```
 
-and in the broker Mac's `~/.ssh/config`:
+### Persistent tunnels (agents that run on their own)
+
+List the hosts in the broker Mac's config and install one launchd user agent per host:
+
+```json
+"tunnels": ["other-mac", { "host": "build-box", "remote_sock": "/Users/builder/.bws-broker/fwd.sock" }]
+```
+
+```bash
+bws-touchid tunnel install           # (re)writes ~/Library/LaunchAgents/bws-touchid.tunnel.<host>.plist
+bws-touchid tunnel status --probe    # launchd state + a ping through each remote fwd.sock (no Touch ID)
+bws-touchid tunnel uninstall
+```
+
+Each agent runs `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
+-o ServerAliveCountMax=3 -R <remote fwd.sock>:<broker.sock> <host>` with `KeepAlive` and a 10 s
+`ThrottleInterval`, so a dropped or killed tunnel is back within seconds. `host` is an ssh alias (keys, user
+and port come from `~/.ssh/config`; the key must work non-interactively). Without `remote_sock`, install
+asks the host for its `$HOME` (sshd does not expand `~` in socket paths). `tunnel_ssh_options` adds `-o`
+options. Start, exit code and duration of every tunnel run go to the log; ssh's own errors go to
+`~/Library/Logs/bws-touchid.tunnel.<host>.err.log`. Install again after changing `tunnels`; hosts removed
+from the list are unloaded.
+
+Every request through a tunnel still needs your fingerprint, but the socket is there whenever the broker Mac
+is awake and on the network, so any process on that host can ask at any time.
+
+On a host that has a tunnel, do not also give your interactive sessions a `RemoteForward` to the same path:
+with `--reaper` the session prints "remote port forwarding failed" (the tunnel holds the socket), and with
+`--sshd-unlink` the session steals the socket and leaves it dead when it ends. The tunnel also cannot use
+`ClearAllForwardings=yes`, which clears its own `-R` too. After the tunnel restarts, the remote end may
+refuse the bind until the old socket is gone (sshd-unlink: immediately; reaper: within 5 s); the
+restart loop retries.
+
+A remote Mac that cannot show Touch ID (a laptop running lid-closed, a headless Mac) should not run its own
+broker. Set `"local_broker": false` in its config so clients only ever use `fwd.sock`, unload its broker
+(`launchctl bootout gui/$(id -u)/bws-touchid.broker`) and remove its tokens (`bws-touchid delete read`,
+`... delete write`). To turn it back into a broker later (e.g. a Touch ID keyboard is attached), drop
+`local_broker`, run `./install.sh` there and store the tokens again.
+
+### Interactive sessions only
+
+For a host without a tunnel, add to the broker Mac's `~/.ssh/config`:
 
 ```
 Host other-mac
@@ -69,13 +111,14 @@ dead sockets every 5 s. Two simultaneous sessions to the same host: the first ke
 A Mac can also run its own broker. Clients pick a socket in this order: `$BWS_BROKER_SOCK`; inside an ssh
 session (`SSH_CONNECTION` set) the forwarded socket, then the local broker; otherwise the local broker,
 then the forwarded socket. So work started from the remote Mac's own keyboard prompts on that Mac, and
-work in an ssh session from the broker Mac prompts there. When neither is reachable, clients fail with a
-message telling the agent to ask the owner.
+work in an ssh session from the broker Mac prompts there. `"local_broker": false` removes the local broker
+from that list. When nothing is reachable, clients fail with "<broker_name> broker unreachable" and tell the
+agent to ask the owner. `bws-touchid ping [SOCKET]` checks reachability without a Touch ID prompt.
 
 ## Config
 
 `~/.config/bws-touchid/config.json`, see [config.example.json](config.example.json). On client-only
-hosts only `broker_name` is used.
+hosts only `broker_name` and `local_broker` are used.
 
 | key | meaning |
 |---|---|
@@ -85,6 +128,9 @@ hosts only `broker_name` is used.
 | `project_names` | id → name map, only for readable notifications |
 | `denied_projects` / `denied_key_prefixes` | never read or written; also filtered out of `bws-gated` output |
 | `server_urls` | `--server-url` values `bws-gated` accepts (default: Bitwarden US and EU cloud) |
+| `local_broker` | clients: `false` = never use this Mac's own `broker.sock`, only `fwd.sock` (default `true`) |
+| `tunnels` | broker Mac: hosts that get a persistent tunnel, `"alias"` or `{"host", "remote_sock"}` |
+| `tunnel_ssh_options` | extra `-o` options for the tunnels, e.g. `["ConnectTimeout=5"]` |
 
 ## Threat model and limits
 
@@ -107,8 +153,9 @@ What it does not:
   runs. It is never logged and is redacted from errors.
 - `bws-touchid store` needs no Touch ID, so a local process could overwrite a token file with a different
   token. That denies service or points writes at another account; it does not leak your token.
-- Any process on a remote Mac can use the forwarded socket while your ssh session is open. Each request
-  still needs your fingerprint, and the notification says which host it came from.
+- Any process on a remote Mac can use the forwarded socket while your ssh session is open, or at any time
+  if it has a persistent tunnel. Each request still needs your fingerprint, and the notification says which
+  host it came from. Only add tunnels to hosts whose requests you are willing to see at any hour.
 - Losing the Mac's Secure Enclave key (new Mac, reset) means re-storing the tokens; the `.age` files are
   useless elsewhere.
 

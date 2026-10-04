@@ -14,6 +14,8 @@ Commands (also reachable through the bws-save / bws-gated symlinks):
   bws-touchid run [--token NAME] -- CMD...            Touch ID, then exec CMD with BWS_ACCESS_TOKEN set
   bws-touchid serve                                   the broker (launchd, gui/<uid>)
   bws-touchid reap                                    delete a dead forwarded socket (remote hosts)
+  bws-touchid ping [SOCKET]                           is a broker reachable? (no Touch ID)
+  bws-touchid tunnel install|status|uninstall         persistent ssh -R tunnels to the hosts in `tunnels`
   bws-save [--project P] [--note N] [--dry-run] KEY   VALUE on stdin -> broker -> bws secret create/edit
   bws-gated <bws args>                                read-only bws through the broker (drop-in BWS_BIN)
 
@@ -66,6 +68,11 @@ DEFAULTS = {
     "bws_path": "",                           # default: first bws on PATH / common locations
     "age_path": "",
     "notify": True,                           # macOS notification before every decrypt
+    "local_broker": True,                     # clients: false = never use this Mac's broker.sock,
+                                              # only the forwarded socket (Mac without usable Touch ID)
+    "tunnels": [],                            # broker Mac: hosts that get a persistent ssh -R tunnel,
+                                              # "alias" or {"host": "alias", "remote_sock": "/abs/fwd.sock"}
+    "tunnel_ssh_options": [],                 # extra ssh -o options for the tunnels
 }
 
 
@@ -488,32 +495,42 @@ def cmd_serve(_argv):
 
 # ---------------------------------------------------------------- client
 
-def not_connected(c):
-    return ("bws broker not reachable: this shell is not connected from %s.\n"
-            "Bitwarden SM access needs the owner's Touch ID on that Mac, through an ssh session opened\n"
-            "FROM it (RemoteForward to ~/.bws-broker/fwd.sock). Ask the owner to connect, or to store\n"
-            "the value himself. Nothing was sent." % c["broker_name"])
+def not_connected(c, tried):
+    return ("%s broker unreachable (tried %s).\n"
+            "Bitwarden SM access needs the owner's Touch ID on that Mac. It reaches this host through\n"
+            "~/.bws-broker/fwd.sock (a persistent tunnel or an ssh session opened FROM that Mac); the Mac\n"
+            "may be asleep, off the network, or its tunnel down. Ask the owner, or ask him to store the\n"
+            "value himself. Nothing was sent." % (c["broker_name"], ", ".join(tried) or "nothing"))
+
+
+def socket_order(c):
+    """Sockets a client tries, in order. BWS_BROKER_SOCK first; inside an ssh session the broker of
+    the Mac that opened it (forwarded socket) wins, otherwise this Mac's own broker. local_broker=false
+    drops this Mac's broker entirely."""
+    order = [FWD_SOCK, LOCAL_SOCK] if os.environ.get("SSH_CONNECTION") else [LOCAL_SOCK, FWD_SOCK]
+    if not c.get("local_broker", True):
+        order.remove(LOCAL_SOCK)
+    env = os.environ.get("BWS_BROKER_SOCK")
+    return ([env] if env else []) + [p for p in order if p != env]
+
+
+def connect_first(paths):
+    for p in paths:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(p)
+            return s
+        except OSError:
+            s.close()
+    return None
 
 
 def broker_call(req):
     c = load_config()
-    # Inside an ssh session, the broker of the Mac that opened it (forwarded socket) wins;
-    # otherwise this Mac's own broker, if it has one. BWS_BROKER_SOCK overrides both.
-    order = [FWD_SOCK, LOCAL_SOCK] if os.environ.get("SSH_CONNECTION") else [LOCAL_SOCK, FWD_SOCK]
-    candidates = [os.environ.get("BWS_BROKER_SOCK")] + order
-    s = None
-    for p in candidates:
-        if not p:
-            continue
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(p)
-            break
-        except OSError:
-            s.close()
-            s = None
+    order = socket_order(c)
+    s = connect_first(order)
     if s is None:
-        die(not_connected(c), 3)
+        die(not_connected(c, [p.replace(HOME, "~") for p in order]), 3)
     try:
         s.settimeout(160)
         s.sendall(json.dumps(req).encode() + b"\n")
@@ -687,17 +704,15 @@ def cmd_status(_argv):
     toks = sorted(f[:-4] for f in os.listdir(TOKENS_DIR) if f.endswith(".age")) if os.path.isdir(TOKENS_DIR) else []
     print("tokens:    %s" % (", ".join(toks) or "none"))
     reach = "unreachable"
-    for p in (LOCAL_SOCK, FWD_SOCK):
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            s.connect(p)
+    for p in socket_order(c):
+        s = connect_first([p])
+        if s:
+            s.close()
             reach = "reachable at " + p
             break
-        except OSError:
-            pass
-        finally:
-            s.close()
     print("broker:    %s (%s)" % (reach, c["broker_name"]))
+    if not c.get("local_broker", True):
+        print("           local_broker=false: this Mac's broker.sock is never used")
     print("config:    %s" % (CONFIG_PATH if os.path.exists(CONFIG_PATH) else "defaults"))
     print("log:       %s" % LOG_PATH)
 
@@ -739,6 +754,188 @@ def cmd_reap(_argv):
         s.close()
 
 
+def cmd_ping(argv):
+    """Exit 0 if a broker answers a ping (no Touch ID, not logged), 3 otherwise."""
+    c = load_config()
+    paths = argv[:1] or socket_order(c)
+    for p in paths:
+        s = connect_first([p])
+        if not s:
+            continue
+        try:
+            s.settimeout(10)
+            s.sendall(b'{"op": "ping"}\n')
+            r = json.loads(read_line(s, 4096) or b"null")
+        except (OSError, ValueError):
+            r = None
+        finally:
+            s.close()
+        if isinstance(r, dict) and r.get("ok"):
+            print("ok %s (%s)" % (p, r.get("broker_name", "?")))
+            sys.exit(0)
+    die(not_connected(c, [p.replace(HOME, "~") for p in paths]), 3)
+
+
+# ---------------------------------------------------------------- tunnels
+
+TUNNEL_PREFIX = "bws-touchid.tunnel."
+LAUNCH_AGENTS = os.path.join(HOME, "Library", "LaunchAgents")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$")
+
+
+def tunnel_list(c):
+    out = []
+    for t in c.get("tunnels") or []:
+        t = {"host": t} if isinstance(t, str) else dict(t)
+        if not HOST_RE.match(str(t.get("host", ""))):
+            die("bad tunnel host %r (an ssh alias or user@host)" % t.get("host"))
+        rs = t.get("remote_sock") or ""
+        if rs and (not rs.startswith("/") or ":" in rs):
+            die("tunnel %s: remote_sock must be an absolute path" % t["host"])
+        t["label"] = TUNNEL_PREFIX + re.sub(r"[^A-Za-z0-9.-]", "-", t["host"])
+        out.append(t)
+    return out
+
+
+def ssh_base(c):
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    for o in c.get("tunnel_ssh_options") or []:
+        opts += ["-o", str(o)]
+    return ["/usr/bin/ssh"] + opts
+
+
+def tunnel_ssh_argv(c, host, remote_sock):
+    # No ClearAllForwardings here: it would also clear this -R. Do not also put a RemoteForward to
+    # the same socket in ~/.ssh/config for this host, or the second bind fails.
+    return ssh_base(c) + ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
+                          "-o", "ServerAliveCountMax=3", "-R", "%s:%s" % (remote_sock, LOCAL_SOCK), host]
+
+
+def tunnel_plist(label, host, remote_sock):
+    esc = lambda x: x.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")  # noqa: E731
+    me = os.path.realpath(sys.argv[0]) if os.path.basename(sys.argv[0]) == "bws-touchid" else \
+        os.path.join(HOME, ".local", "bin", "bws-touchid")
+    args = ["/usr/bin/python3", me, "tunnel", "run", host, remote_sock]
+    errlog = os.path.join(HOME, "Library", "Logs", label + ".err.log")
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key><array>%s</array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>%s</string>
+</dict></plist>
+""" % (esc(label), "".join("<string>%s</string>" % esc(a) for a in args), esc(errlog))
+
+
+def launchctl(*args):
+    return subprocess.run(["/bin/launchctl"] + list(args), capture_output=True, text=True)
+
+
+def remote_fwd_path(c, host):
+    """Ask HOST for its $HOME (forwarded socket paths are not ~-expanded) and create ~/.bws-broker."""
+    r = subprocess.run(ssh_base(c) + ["-o", "ClearAllForwardings=yes", host,
+                                     'mkdir -p "$HOME/.bws-broker" && chmod 700 "$HOME/.bws-broker" '
+                                     '&& printf %s "$HOME"'], capture_output=True, text=True, timeout=30)
+    home = r.stdout.strip()
+    if r.returncode != 0 or not home.startswith("/"):
+        die("tunnel %s: cannot reach it over ssh (%s)" % (host, clean(r.stderr.strip(), 160)))
+    return home + "/.bws-broker/fwd.sock"
+
+
+def tunnel_install(c):
+    uid = str(os.getuid())
+    tunnels = tunnel_list(c)
+    wanted = {t["label"] for t in tunnels}
+    os.makedirs(LAUNCH_AGENTS, exist_ok=True)
+    for f in sorted(os.listdir(LAUNCH_AGENTS)):  # drop tunnels no longer in the config
+        if f.startswith(TUNNEL_PREFIX) and f.endswith(".plist") and f[:-6] not in wanted:
+            launchctl("bootout", "gui/%s/%s" % (uid, f[:-6]))
+            os.remove(os.path.join(LAUNCH_AGENTS, f))
+            print("removed %s" % f[:-6])
+    for t in tunnels:
+        rs = t.get("remote_sock") or remote_fwd_path(c, t["host"])
+        path = os.path.join(LAUNCH_AGENTS, t["label"] + ".plist")
+        with open(path, "w") as f:
+            f.write(tunnel_plist(t["label"], t["host"], rs))
+        launchctl("bootout", "gui/%s/%s" % (uid, t["label"]))
+        r = launchctl("bootstrap", "gui/" + uid, path)
+        if r.returncode != 0:
+            die("launchctl bootstrap %s failed: %s" % (t["label"], r.stderr.strip()))
+        print("loaded %s: %s -> %s" % (t["label"], t["host"], rs))
+    if not tunnels:
+        print("no tunnels in %s" % CONFIG_PATH)
+
+
+def tunnel_uninstall(_c):
+    uid = str(os.getuid())
+    for f in sorted(os.listdir(LAUNCH_AGENTS)) if os.path.isdir(LAUNCH_AGENTS) else []:
+        if f.startswith(TUNNEL_PREFIX) and f.endswith(".plist"):
+            launchctl("bootout", "gui/%s/%s" % (uid, f[:-6]))
+            os.remove(os.path.join(LAUNCH_AGENTS, f))
+            print("removed %s" % f[:-6])
+
+
+def tunnel_status(c, probe):
+    uid = str(os.getuid())
+    tunnels = tunnel_list(c)
+    if not tunnels:
+        print("no tunnels in %s" % CONFIG_PATH)
+    bad = 0
+    for t in tunnels:
+        r = launchctl("print", "gui/%s/%s" % (uid, t["label"]))
+        if r.returncode != 0:
+            print("%-40s not loaded (bws-touchid tunnel install)" % t["label"])
+            bad += 1
+            continue
+        info = dict(re.findall(r"^\s*(state|pid|runs|last exit code) = (.+)$", r.stdout, re.M))
+        line = "%-40s %s pid=%s runs=%s last-exit=%s" % (t["label"], info.get("state", "?"), info.get("pid", "-"),
+                                                        info.get("runs", "?"), info.get("last exit code", "-"))
+        if probe:
+            q = subprocess.run(ssh_base(c) + ["-o", "ClearAllForwardings=yes", t["host"],
+                                              "/usr/bin/python3 ~/.local/bin/bws-touchid ping " +
+                                              (t.get("remote_sock") or "~/.bws-broker/fwd.sock")],
+                               capture_output=True, text=True, timeout=40)
+            ok = q.returncode == 0
+            bad += 0 if ok else 1
+            line += "  remote fwd.sock: " + ("answers" if ok else "NOT answering")
+        elif "pid" not in info:
+            bad += 1
+        print(line)
+    sys.exit(1 if bad else 0)
+
+
+def tunnel_run(host, remote_sock):
+    """launchd entry point: one ssh -R tunnel, logged; launchd restarts it when it exits."""
+    import signal
+    import time
+    c = load_config()
+    argv = tunnel_ssh_argv(c, host, remote_sock)
+    log({"op": "tunnel", "result": "start", "host": host, "detail": remote_sock})
+    t0 = time.time()
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL)
+    signal.signal(signal.SIGTERM, lambda *_: p.terminate())
+    code = p.wait()
+    log({"op": "tunnel", "result": "exit=%d" % code, "host": host, "detail": "after %ds" % (time.time() - t0)})
+    sys.exit(1)
+
+
+def cmd_tunnel(argv):
+    sub = argv[0] if argv else ""
+    c = load_config()
+    if sub == "install":
+        return tunnel_install(c)
+    if sub == "uninstall":
+        return tunnel_uninstall(c)
+    if sub == "status":
+        return tunnel_status(c, "--probe" in argv)
+    if sub == "run" and len(argv) == 3 and HOST_RE.match(argv[1]) and argv[2].startswith("/"):
+        return tunnel_run(argv[1], argv[2])
+    die("usage: bws-touchid tunnel install | status [--probe] | uninstall", 2)
+
+
 def main():
     prog = os.path.basename(sys.argv[0])
     argv = sys.argv[1:]
@@ -747,7 +944,8 @@ def main():
     if prog == "bws-gated":
         return cmd_gated(argv)
     cmds = {"init": cmd_init, "store": cmd_store, "status": cmd_status, "delete": cmd_delete,
-            "run": cmd_run, "serve": cmd_serve, "reap": cmd_reap, "save": cmd_save, "gated": cmd_gated}
+            "run": cmd_run, "serve": cmd_serve, "reap": cmd_reap, "save": cmd_save, "gated": cmd_gated,
+            "ping": cmd_ping, "tunnel": cmd_tunnel}
     if not argv or argv[0] not in cmds:
         print(__doc__.strip())
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)

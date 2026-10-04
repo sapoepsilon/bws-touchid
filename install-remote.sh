@@ -7,7 +7,9 @@
 #                  over the stale socket the previous session left behind)
 # Then add to THIS Mac's ~/.ssh/config, under that Host only:
 #   RemoteForward <HOST $HOME>/.bws-broker/fwd.sock <this $HOME>/.bws-broker/broker.sock
-# Avoid it on hosts used by long-lived tunnels with ExitOnForwardFailure=yes.
+# Or list HOST under "tunnels" in the broker config and run `bws-touchid tunnel install` (persistent;
+# then do not also add the RemoteForward). Avoid RemoteForward on hosts used by other long-lived
+# tunnels with ExitOnForwardFailure=yes.
 set -euo pipefail
 cd "$(dirname "$0")"
 HOST="${1:?usage: install-remote.sh HOST [--sshd-unlink|--reaper] [--config FILE]}"; shift
