@@ -1,19 +1,23 @@
 {
-  "_comment": "Throwaway test keys generated for these vectors only. ECDSA signatures are randomized: implementations must VERIFY these signatures, not reproduce them. Copied from whispera-link docs/vectors/v1.json; the `approval` vector's host/via/broker strings were replaced with neutral names and re-signed with the same throwaway approve key (see `_sanitized`).",
+  "_comment": "Throwaway test keys generated for these vectors only. ECDSA signatures are randomized: implementations must VERIFY these signatures, not reproduce them.",
+  "_WARNING": "THROWAWAY TEST KEYS ONLY. Every private_pkcs8_pem in this file is public test data, generated solely for these vectors; it protects nothing and MUST NEVER be used as a real link, approve, daemon or APNs key. Real keys never enter this repository.",
   "prefix_spki_p256_hex": "3059301306072a8648ce3d020106082a8648ce3d030107034200",
   "link": {
+    "_note": "throwaway test key (public test data, not a secret)",
     "private_pkcs8_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwQIPeO/FveQQ7E+F\nlon6vlwRiljPa6uYMytuYmpAIq2hRANCAATUQT+JMXiNM20WXTUJLZqEMd/9Pcke\noZDuXOIWn1AYkuUPFU1IV+VOqQgQ7OPURUOSQJ3seTM6+hnzhHv/JN0u\n-----END PRIVATE KEY-----\n",
     "public_x963_b64": "BNRBP4kxeI0zbRZdNQktmoQx3/09yR6hkO5c4hafUBiS5Q8VTUhX5U6pCBDs49RFQ5JAnex5Mzr6GfOEe/8k3S4=",
     "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1EE/iTF4jTNtFl01CS2ahDHf/T3JHqGQ7lziFp9QGJLlDxVNSFflTqkIEOzj1EVDkkCd7HkzOvoZ84R7/yTdLg==",
     "fingerprint": "6dfed3738678b56bf8dab366833ef01ef791b004765ad36992fd7e5a532af9b6"
   },
   "approve": {
+    "_note": "throwaway test key (public test data, not a secret)",
     "private_pkcs8_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiaRnnMWNFVyQa8D0\nOmWAq/VQDsql8IKuflqG46XiiiOhRANCAARWHYcfs6PggV/eEnIol1m9GoIluxUm\nwiE73I4UhWD30YF3hnwKDr2HrCLQnXbDeE/jj+CGPsKI7BvLcLip1wzv\n-----END PRIVATE KEY-----\n",
     "public_x963_b64": "BFYdhx+zo+CBX94SciiXWb0agiW7FSbCITvcjhSFYPfRgXeGfAoOvYesItCddsN4T+OP4IY+wojsG8twuKnXDO8=",
     "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVh2HH7Oj4IFf3hJyKJdZvRqCJbsVJsIhO9yOFIVg99GBd4Z8Cg69h6wi0J12w3hP44/ghj7CiOwby3C4qdcM7w==",
     "fingerprint": "671cee6c7cfe0523b4359d9177db74c7cd6fd3a96fe7515bd97e67d8709f1f5e"
   },
   "daemon": {
+    "_note": "throwaway test key (public test data, not a secret)",
     "private_pkcs8_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgfkeoQcTJYgHDvefN\nJhJGdtzV+ksrHHcYzHanvsmawoGhRANCAAScArTMacASkKqwa1CNA6JyTMyxoNgm\nMHCczPD1R6VFEfH6XZAnyMpv9avRoPByeWqwv3nMCERuquRdyaRjLZEk\n-----END PRIVATE KEY-----\n",
     "public_x963_b64": "BJwCtMxpwBKQqrBrUI0DonJMzLGg2CYwcJzM8PVHpUUR8fpdkCfIym/1q9Gg8HJ5arC/ecwIRG6q5F3JpGMtkSQ=",
     "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEnAK0zGnAEpCqsGtQjQOickzMsaDYJjBwnMzw9UelRRHx+l2QJ8jKb/Wr0aDwcnlqsL95zAhEbqrkXcmkYy2RJA==",
@@ -66,6 +70,5 @@
     "body_utf8": "{\"device_id\":\"dev_aaaaaaaaaaaaaaaaaaaaaaaa\"}",
     "message_utf8": "WL1-PAIR-RESP\nede1ebad2da8ab2ce890a7a6976fc4009514ca339531a397b65fb46c83522960",
     "signature_der_b64": "MEUCICffAXxjJJK2e3tRwLYkCylYVDVlxKsamv77U1rGZ+XeAiEA7go51rEazeymPZcbgfZs9BHbQhAJr3ZKEWfipsKiUd0="
-  },
-  "_sanitized": "approval.request host/via/broker changed from the upstream file; canonical/signed bytes and signature regenerated with approve.private_pkcs8_pem via /usr/bin/openssl. tests also check the upstream file when ../whispera-link is checked out."
+  }
 }

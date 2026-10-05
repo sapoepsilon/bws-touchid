@@ -150,13 +150,16 @@ whichever answers first (whispera-link `docs/PROTOCOL.md` §7, §8, §11):
   `approvers/<device_id>.pub`; a bad signature, unknown device, or expired request is a **deny**.
 - At the same time the Touch ID decrypt runs as before (notification text ends in "— or approve on iPhone").
   Whichever leg answers first wins; the other is cancelled (the Touch ID sheet is killed). A deny from either
-  leg is a deny; no answer within 120 s is a deny.
+  leg is a deny; no answer within 120 s (`["iphone"]` alone: `phone_window_s` + 5 s) is a deny.
 - A phone approval decrypts `tokens/<name>.iphone.age` with a second Secure Enclave identity that has **no
   biometry**; it never falls back to the Touch ID copy.
-- Daemon not running, no paired device, or no ack within 2 s: the iPhone leg is skipped and Touch ID works
-  exactly as before (the log line says `iphone-unavailable:<why>`).
+- Daemon not running, running as another user, no paired device, no pinned key, no iPhone copy of the
+  token, or no ack within 2 s: the iPhone leg is skipped and Touch ID works exactly as before, including
+  its own error messages (the log line's `detail` gains `iphone-unavailable:<why>`).
+- Pinned keys are refused when the pin file or `approvers_dir` is a symlink, not yours, or group/world-writable.
+  A bad `approvers` list refuses every gated op, dry runs included.
 - Log lines gain `approver=touchid|iphone:<device_id>|none` and `request_id=apr_…`; results `denied`,
-  `timeout`, `no-approver`.
+  `timeout`, `no-approver`. With the default `["touchid"]` the log line is exactly as before (no new fields).
 
 Setup (two Touch IDs, once):
 
@@ -210,7 +213,9 @@ What it does not:
 python3 -m unittest -v      # temp HOME, fake age / age-plugin-se / bws, fake approvals socket; ~40 s
 ```
 
-No Secure Enclave, real token, Touch ID prompt or Bitwarden call is involved. The P-256 keys in
+No Secure Enclave, real token, Touch ID prompt or Bitwarden call is involved. The cross-repo test
+(`tests/e2e/integration_broker.sh` in whispera-link, with this repo checked out next to it) runs this
+script as `serve` against the real whispera-link daemon with the same fakes in a temp HOME. The P-256 keys in
 `tests/fakes/vectors_v1.json` (whispera-link's known-answer vectors) and the ones the tests generate are
 throwaway test keys.
 
