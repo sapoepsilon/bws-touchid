@@ -8,5 +8,7 @@
   "denied_projects": ["owner-only"],
   "denied_key_prefixes": ["OWNER_"],
   "notify": true,
-  "tunnels": ["other-mac", { "host": "build-box", "remote_sock": "/Users/builder/.bws-broker/fwd.sock" }]
+  "tunnels": ["other-mac", { "host": "build-box", "remote_sock": "/Users/builder/.bws-broker/fwd.sock" }],
+  "_approvers": "[\"touchid\"] = Touch ID only (default). After bws-touchid iphone-setup + approver add: [\"touchid\", \"iphone\"]",
+  "approvers": ["touchid"]
 }

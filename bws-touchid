@@ -16,6 +16,8 @@ Commands (also reachable through the bws-save / bws-gated symlinks):
   bws-touchid reap                                    delete a dead forwarded socket (remote hosts)
   bws-touchid ping [SOCKET]                           is a broker reachable? (no Touch ID)
   bws-touchid tunnel install|status|uninstall         persistent ssh -R tunnels to the hosts in `tunnels`
+  bws-touchid approver add DEVICE_ID PEM | list | remove DEVICE_ID   pin an iPhone approve key
+  bws-touchid iphone-setup                            one-time: no-biometry identity + iPhone token copies
   bws-save [--project P] [--note N] [--dry-run] KEY   VALUE on stdin -> broker -> bws secret create/edit
   bws-gated <bws args>                                read-only bws through the broker (drop-in BWS_BIN)
 
@@ -25,21 +27,27 @@ Python 3.9 standard library only. See README.md for the threat model.
 import base64
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 HOME = os.path.expanduser("~")
 CONF_DIR = os.environ.get("BWS_TOUCHID_HOME") or os.path.join(HOME, ".config", "bws-touchid")
 CONFIG_PATH = os.path.join(CONF_DIR, "config.json")
 IDENTITY = os.path.join(CONF_DIR, "identity.txt")
 RECIPIENT = os.path.join(CONF_DIR, "recipient.txt")
+RECIPIENT_IPHONE = os.path.join(CONF_DIR, "recipient-iphone.txt")
 TOKENS_DIR = os.path.join(CONF_DIR, "tokens")
 SOCK_DIR = os.path.join(HOME, ".bws-broker")
 LOCAL_SOCK = os.path.join(SOCK_DIR, "broker.sock")
@@ -55,6 +63,20 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 TOKEN_RE = re.compile(r"^0\.[0-9a-fA-F-]{36}\.[^:\s]+:[A-Za-z0-9+/=]+$")
 SOL_LOCAL, LOCAL_PEERCRED, LOCAL_PEERPID = 0, 0x001, 0x002
 EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local", "bin")]
+
+# Approvers (whispera-link protocol v1, PROTOCOL.md §7, §8, §11). Module constants so tests can shrink them.
+KNOWN_APPROVERS = ("touchid", "iphone")
+TOUCHID_WINDOW_S = 120          # Touch ID leg deadline (today's decrypt timeout)
+PHONE_WINDOW_MIN, PHONE_WINDOW_MAX = 30, 110
+PHONE_CONNECT_S = 1.0           # approvals.sock connect timeout
+PHONE_ACK_S = 2.0               # wait for approval.ack
+PHONE_GRACE_S = 5               # iphone-only: deadline = expires_at + this
+IPHONE_DECRYPT_S = 10
+KILL_GRACE_S = 1.0
+MAX_DAEMON_LINE = 64 * 1024
+OPENSSL = "/usr/bin/openssl"    # absolute path on purpose, never PATH
+SPKI_P256_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
+DEVICE_RE = re.compile(r"^dev_[a-z2-7]{24}$")
 
 DEFAULTS = {
     "broker_name": "the broker Mac",          # shown to agents when the broker is unreachable
@@ -73,6 +95,12 @@ DEFAULTS = {
     "tunnels": [],                            # broker Mac: hosts that get a persistent ssh -R tunnel,
                                               # "alias" or {"host": "alias", "remote_sock": "/abs/fwd.sock"}
     "tunnel_ssh_options": [],                 # extra ssh -o options for the tunnels
+    "approvers": ["touchid"],                 # who may approve a gated op: "touchid", "iphone" (race)
+    "iphone_token_identity": "",              # default: <conf dir>/identity-iphone.txt (no biometry)
+    "approvals_socket": "~/.whispera-link/approvals.sock",   # whispera-link daemon (iphone approver)
+    "approvers_dir": "~/.bws-broker/approvers",               # pinned approve keys <device_id>.pub
+    "phone_window_s": 100,                    # how long the phone may answer (clamped 30-110)
+    "age_plugin_se_path": "",
 }
 
 
@@ -124,7 +152,11 @@ def denied_key(k, c):
 def log(fields):
     fields = dict(fields)
     fields["ts"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-    order = ["ts", "op", "result", "key", "project", "token", "host", "caller", "via", "detail"]
+    notes = fields.pop("notes", None)
+    if notes:
+        fields["detail"] = " ".join(([fields["detail"]] if fields.get("detail") else []) + list(notes))
+    order = ["ts", "op", "result", "key", "project", "token", "host", "caller", "via", "approver",
+             "request_id", "detail"]
     line = " ".join("%s=%s" % (k, clean(fields[k], 200)) for k in order if fields.get(k)) + "\n"
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -198,6 +230,545 @@ def run_bws(args, token, c, timeout=60):
     if len(r.stdout) > MAX_STDOUT:
         return 1, b"", "bws output too large"
     return r.returncode, r.stdout, err[:600]
+
+
+# ------------------------------------------------------------ approvers
+#
+# A gated op (save, bws) needs one approval before a token is decrypted. With the default
+# `"approvers": ["touchid"]` that is exactly the old notify() + decrypt_token() path. With "iphone" in
+# the list the broker races the Touch ID decrypt against a phone-signed approval relayed by the
+# whispera-link daemon (PROTOCOL.md §8, §11.2). The broker builds and serialises the canonical request
+# itself and re-verifies every phone signature with /usr/bin/openssl against a pinned key; the daemon
+# is only a relay. First valid answer wins; a deny from either leg is a deny; the deadline is a deny.
+
+def expand(p):
+    p = str(p or "")
+    return HOME + p[1:] if p == "~" or p.startswith("~/") else p
+
+
+def approvers_of(c):
+    """The configured approver list, or None when it is unusable (fail closed)."""
+    a = c.get("approvers")
+    if not isinstance(a, list) or not a or not all(isinstance(x, str) and x in KNOWN_APPROVERS for x in a) \
+            or len(set(a)) != len(a):
+        return None
+    return a
+
+
+def is_default_approvers(c):
+    return approvers_of(c) == ["touchid"]
+
+
+def phone_window(c):
+    try:
+        w = int(c.get("phone_window_s", 100))
+    except (TypeError, ValueError):
+        w = 100
+    return max(PHONE_WINDOW_MIN, min(PHONE_WINDOW_MAX, w))
+
+
+def iphone_identity(c):
+    return expand(c.get("iphone_token_identity")) or os.path.join(CONF_DIR, "identity-iphone.txt")
+
+
+def iphone_token_path(name):
+    if not NAME_RE.match(name or ""):
+        raise ValueError("bad token name")
+    return os.path.join(TOKENS_DIR, name + ".iphone.age")
+
+
+def approvers_dir(c):
+    return expand(c.get("approvers_dir") or "~/.bws-broker/approvers")
+
+
+def b32id(prefix):
+    return prefix + "_" + base64.b32encode(os.urandom(15)).decode().lower().rstrip("=")
+
+
+def canonical_bytes(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def build_canonical(c, op, key, summary, project, token, host, caller, via, now=None):
+    created = int(time.time() if now is None else now)
+    return {"v": 1, "request_id": b32id("apr"),
+            "nonce": base64.urlsafe_b64encode(os.urandom(16)).decode().rstrip("="),
+            "op": op, "key": key, "summary": summary, "project": project, "token": token,
+            "host": host, "caller": caller, "via": via, "broker": str(c["broker_name"]),
+            "created_at": created, "expires_at": created + phone_window(c)}
+
+
+# --- P-256 keys and signatures (copied, not imported, from whispera_link/crypto.py; PROTOCOL.md §2.1, §4.5)
+
+def spki_from_pem(text):
+    """DER SubjectPublicKeyInfo of a P-256 public key PEM, or None."""
+    m = re.search(r"-----BEGIN PUBLIC KEY-----([A-Za-z0-9+/=\s]+)-----END PUBLIC KEY-----", text or "")
+    if not m:
+        return None
+    try:
+        der = base64.b64decode("".join(m.group(1).split()), validate=True)
+    except ValueError:
+        return None
+    if len(der) != 91 or not der.startswith(SPKI_P256_PREFIX) or der[26] != 4:
+        return None
+    return der
+
+
+def pem_from_spki(der):
+    b = base64.b64encode(der).decode()
+    return "-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n" % "\n".join(
+        b[i:i + 64] for i in range(0, len(b), 64))
+
+
+def fingerprint(der):
+    return hashlib.sha256(der).hexdigest()
+
+
+def display_fp(der):
+    h = fingerprint(der)[:16]
+    return "-".join(h[i:i + 4] for i in range(0, 16, 4))
+
+
+def p256_verify(spki_der, message, sig_der):
+    """ECDSA P-256 / SHA-256 / DER via /usr/bin/openssl. Any doubt = False."""
+    if not isinstance(sig_der, bytes) or not 8 <= len(sig_der) <= 80 or not os.path.exists(OPENSSL):
+        return False
+    tmp = tempfile.mkdtemp(prefix="bws-touchid-v-")
+    try:
+        os.chmod(tmp, 0o700)
+        pub, sig = os.path.join(tmp, "pub.pem"), os.path.join(tmp, "sig.der")
+        with open(pub, "w") as f:
+            f.write(pem_from_spki(spki_der))
+        with open(sig, "wb") as f:
+            f.write(sig_der)
+        r = subprocess.run([OPENSSL, "dgst", "-sha256", "-verify", pub, "-signature", sig], input=message,
+                           capture_output=True, timeout=5, env={"PATH": "/usr/bin:/bin"})
+        return r.returncode == 0 and r.stdout.strip() == b"Verified OK"
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def safe_owned(path, want_dir):
+    """Not a symlink, owned by us, not group/world-writable, right type."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    kind_ok = stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)
+    return kind_ok and st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
+def load_pin(c, device_id):
+    """SPKI DER of a pinned approve key, or (None, why)."""
+    if not DEVICE_RE.match(device_id or ""):
+        return None, "bad device id"
+    d = approvers_dir(c)
+    path = os.path.join(d, device_id + ".pub")
+    if not os.path.lexists(path):
+        return None, "not pinned"
+    if not safe_owned(d, True) or not safe_owned(path, False):
+        return None, "pin file or dir is a symlink, not ours, or group/world-writable"
+    try:
+        with open(path) as f:
+            der = spki_from_pem(f.read(4096))
+    except (OSError, UnicodeDecodeError):
+        der = None
+    return (der, "") if der else (None, "not a P-256 public key PEM")
+
+
+def pinned_devices(c):
+    d = approvers_dir(c)
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    return [n[:-4] for n in names if n.endswith(".pub") and DEVICE_RE.match(n[:-4])]
+
+
+# --- the legs
+
+class Leg(object):
+    """One approver in the race. poll() returns None while undecided, else a decision dict:
+    {"kind": "approve"|"deny"|"unavailable", "approver": str, "why": str, ...}. A leg that returned a
+    decision is no longer live. cancel(reason) stops it (kills the prompt / tells the daemon)."""
+    name = "?"
+    live = False
+
+    def fileno_or_none(self):
+        return None
+
+    def poll(self, now):
+        raise NotImplementedError
+
+    def cancel(self, reason):
+        pass
+
+    def token(self):
+        """After an approve: (token, None) or (None, error)."""
+        raise NotImplementedError
+
+
+class TouchIdLeg(Leg):
+    name = "touchid"
+
+    def __init__(self, c, tname, deadline):
+        self.c, self.tname, self.deadline = c, tname, deadline
+        self.proc, self._tok, self.error = None, None, ""
+
+    def start(self):
+        path = token_path(self.tname)
+        if not os.path.isfile(path):
+            self.error = "no token named '%s' on the broker Mac (owner: bws-touchid store %s)" % (self.tname, self.tname)
+            return False
+        age = find_tool("age", self.c.get("age_path"))
+        if not age:
+            self.error = "age not found (brew install age age-plugin-se)"
+            return False
+        self.proc = subprocess.Popen([age, "-d", "-i", IDENTITY, path], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=tool_env(),
+                                     start_new_session=True)
+        self.live = True
+        return True
+
+    def poll(self, now):
+        if not self.live:
+            return None
+        if self.proc.poll() is None:
+            if now >= self.deadline:
+                self.cancel("timeout")
+                self.error = "timed out waiting for Touch ID"
+                return {"kind": "unavailable", "approver": "touchid", "why": "timeout"}
+            return None
+        out, err = self.proc.communicate()
+        self.live = False
+        if self.proc.returncode == 0:
+            tok = out.decode("utf-8", "replace").strip()
+            if tok:
+                self._tok = tok
+                return {"kind": "approve", "approver": "touchid", "why": ""}
+            self.error = "decrypted token is empty"
+            return {"kind": "unavailable", "approver": "touchid", "why": "empty"}
+        lines = err.decode("utf-8", "replace").strip().splitlines()
+        self.error = "Touch ID / decrypt failed: %s" % clean(lines[-1] if lines else "exit %d" % self.proc.returncode, 160)
+        if "cancel" in err.decode("utf-8", "replace").lower():
+            return {"kind": "deny", "approver": "touchid", "why": "cancel"}
+        return {"kind": "unavailable", "approver": "touchid", "why": "error"}
+
+    def cancel(self, reason):
+        if self.proc is None or self.proc.poll() is not None:
+            self.live = False
+            return
+        for sig, wait in ((signal.SIGTERM, KILL_GRACE_S), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(self.proc.pid, sig)
+            except OSError:
+                pass
+            try:
+                self.proc.wait(wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        try:
+            self.proc.communicate(timeout=1)
+        except (subprocess.SubprocessError, ValueError, OSError):
+            pass
+        self.live = False
+
+    def token(self):
+        return (self._tok, None) if self._tok else (None, self.error or "no token")
+
+
+class IphoneLeg(Leg):
+    """Client of ~/.whispera-link/approvals.sock: one connection per approval (PROTOCOL.md §8)."""
+    name = "iphone"
+
+    def __init__(self, c, canon, tname):
+        self.c, self.canon, self.tname = c, canon, tname
+        self.raw = canonical_bytes(canon)
+        self.rid = canon["request_id"]
+        self.sock, self.buf, self.why, self.device = None, b"", "", ""
+        self.devices = 0
+
+    def start(self):
+        """Connect + request + ack. False (with self.why) = leg unavailable, never a deny."""
+        if not os.path.isfile(iphone_identity(self.c)):
+            self.why = "no-iphone-identity"
+        elif not os.path.isfile(iphone_token_path(self.tname)):
+            self.why = "no-iphone-token-copy"
+        elif not any(load_pin(self.c, d)[0] for d in pinned_devices(self.c)):
+            self.why = "no-pinned-device"
+        if self.why:
+            return False
+        path = expand(self.c.get("approvals_socket") or "~/.whispera-link/approvals.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(PHONE_CONNECT_S)
+            s.connect(path)
+        except (OSError, socket.timeout) as e:
+            s.close()
+            self.why = "daemon-unreachable(%s)" % type(e).__name__
+            return False
+        self.sock = s
+        try:  # the daemon must run as us (it is only a relay, but do not even talk to another uid)
+            peer_uid = struct.unpack_from("Ii", s.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, 76))[1]
+        except OSError:
+            peer_uid = -1
+        if peer_uid != os.getuid():
+            self._close()
+            self.why = "daemon-uid-mismatch"
+            return False
+        try:
+            req = {"op": "approval.request", "v": 1, "request_id": self.rid,
+                   "canonical_b64": base64.b64encode(self.raw).decode(), "expires_at": self.canon["expires_at"]}
+            s.sendall(json.dumps(req).encode() + b"\n")
+            end = time.time() + PHONE_ACK_S
+            line = None
+            while line is None:
+                left = end - time.time()
+                if left <= 0:
+                    raise socket.timeout()
+                s.settimeout(left)
+                line = self._next_line(s.recv(4096) or None)
+            msg = json.loads(line)
+        except socket.timeout:
+            self._close()
+            self.why = "no-ack"
+            return False
+        except (OSError, ValueError, EOFError):
+            self._close()
+            self.why = "bad-ack"
+            return False
+        if not isinstance(msg, dict) or msg.get("request_id") != self.rid:
+            self._close()
+            self.why = "bad-ack"
+            return False
+        if msg.get("op") == "approval.error":
+            self._close()
+            self.why = "daemon-error(%s)" % clean(msg.get("code"), 30)
+            return False
+        n = msg.get("devices")
+        if msg.get("op") != "approval.ack" or not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            self._close()
+            self.why = "no-devices" if msg.get("op") == "approval.ack" else "bad-ack"
+            return False
+        self.devices = n
+        s.setblocking(False)
+        self.live = True
+        return True
+
+    def _next_line(self, chunk):
+        """Feed bytes; return one complete line or None. EOF (chunk None) raises EOFError."""
+        if chunk is None:
+            raise EOFError()
+        self.buf += chunk
+        nl = self.buf.find(b"\n")
+        if nl < 0:
+            if len(self.buf) > MAX_DAEMON_LINE:
+                raise ValueError("line too long")
+            return None
+        line, self.buf = self.buf[:nl], self.buf[nl + 1:]
+        if len(line) > MAX_DAEMON_LINE:
+            raise ValueError("line too long")
+        return line
+
+    def fileno_or_none(self):
+        return self.sock if self.live else None
+
+    def _send(self, obj):
+        if self.sock is None:
+            return
+        try:
+            self.sock.setblocking(True)
+            self.sock.settimeout(1)
+            self.sock.sendall(json.dumps(obj).encode() + b"\n")
+        except OSError:
+            pass
+
+    def _close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.live = False
+
+    def _result(self, outcome):
+        self._send({"op": "approval.result", "request_id": self.rid, "outcome": outcome})
+        self._close()
+
+    def poll(self, now):
+        if not self.live:
+            return None
+        line = None
+        try:
+            if self.buf.find(b"\n") >= 0:
+                line = self._next_line(b"")
+            else:
+                try:
+                    chunk = self.sock.recv(65536)
+                except (BlockingIOError, InterruptedError):
+                    return None
+                line = self._next_line(chunk or None)
+        except EOFError:
+            self._close()
+            return {"kind": "unavailable", "approver": "iphone", "why": "daemon-eof"}
+        except ValueError:
+            self._result("malformed")
+            return {"kind": "deny", "approver": "iphone", "why": "malformed"}
+        except OSError as e:
+            self._close()
+            return {"kind": "unavailable", "approver": "iphone", "why": "socket-error(%s)" % type(e).__name__}
+        if line is None:
+            return None
+        return self._decide(line, now)
+
+    def _decide(self, line, now):
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            msg = None
+        if not isinstance(msg, dict) or msg.get("op") != "approval.decision" \
+                or msg.get("decision") not in ("approve", "deny"):
+            self._result("malformed")
+            return {"kind": "deny", "approver": "iphone", "why": "malformed"}
+        dev = msg.get("device_id") if isinstance(msg.get("device_id"), str) else ""
+        self.device = dev if DEVICE_RE.match(dev) else ""
+        who = "iphone:" + (self.device or "?")
+        if msg["decision"] == "deny":
+            self._result("accepted")
+            return {"kind": "deny", "approver": who, "why": "phone-deny"}
+        outcome = "accepted"
+        if msg.get("request_id") != self.rid:
+            outcome = "malformed"
+        elif not self.device:
+            outcome = "unknown_device"
+        else:
+            der, _why = load_pin(self.c, self.device)
+            if der is None:
+                outcome = "unknown_device"
+            elif now > self.canon["expires_at"]:
+                outcome = "expired"
+            else:
+                sig = msg.get("signature")
+                try:
+                    sig_der = base64.b64decode(sig, validate=True) if isinstance(sig, str) else None
+                except ValueError:
+                    sig_der = None
+                if not sig_der or not p256_verify(der, b"WL1-APPROVE\n" + self.raw, sig_der):
+                    outcome = "bad_signature"
+        self._result(outcome)
+        if outcome != "accepted":  # fail closed: something is tampering or confused
+            return {"kind": "deny", "approver": who, "why": outcome}
+        return {"kind": "approve", "approver": who, "why": ""}
+
+    def cancel(self, reason):
+        if self.live:
+            self._send({"op": "approval.cancel", "request_id": self.rid, "reason": reason})
+        self._close()
+
+    def token(self):
+        """Decrypt the no-biometry iphone copy. Never falls back to the Touch ID copy."""
+        age = find_tool("age", self.c.get("age_path"))
+        if not age:
+            return None, "age not found (brew install age age-plugin-se)"
+        try:
+            r = subprocess.run([age, "-d", "-i", iphone_identity(self.c), iphone_token_path(self.tname)],
+                               capture_output=True, timeout=IPHONE_DECRYPT_S, env=tool_env(),
+                               stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return None, "iPhone token decrypt timed out"
+        if r.returncode != 0:
+            err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+            return None, "iPhone token decrypt failed: %s" % clean(err[-1] if err else "exit %d" % r.returncode, 160)
+        tok = r.stdout.decode("utf-8").strip()
+        return (tok, None) if tok else (None, "decrypted iPhone token is empty")
+
+
+def approve_gate(c, rec, tname, title, msg, canon_fields):
+    """Get one approval and the decrypted token. Returns (token, None) or (None, (result, detail, error)).
+    Sets rec approver / request_id / notes for the audit line."""
+    if is_default_approvers(c):  # exactly the pre-approver behaviour
+        notify(title, msg, c)
+        token, err = decrypt_token(tname, c)
+        return (token, None) if not err else (None, ("auth-failed", err, err))
+    approvers = approvers_of(c)
+    if approvers is None:
+        return None, ("rejected", "bad approvers config", "bad approvers config")
+    canon = build_canonical(c, **canon_fields)
+    rec["request_id"] = canon["request_id"]
+    rec["approver"] = "none"
+    notes = rec.setdefault("notes", [])
+    created = canon["created_at"]
+    deadline_touchid = created + TOUCHID_WINDOW_S
+    deadline = deadline_touchid if "touchid" in approvers else canon["expires_at"] + PHONE_GRACE_S
+    window = int(deadline - created)
+    phone = touch = None
+    try:
+        if "iphone" in approvers:
+            phone = IphoneLeg(c, canon, tname)
+            if not phone.start():
+                notes.append("iphone-unavailable:" + phone.why)
+                phone = None
+        if "touchid" in approvers:
+            notify(title, msg + (" — or approve on iPhone" if phone else ""), c)
+            touch = TouchIdLeg(c, tname, deadline_touchid)
+            if not touch.start():
+                notes.append("touchid-unavailable:start")
+        legs = [x for x in (phone, touch) if x is not None]
+        while True:
+            now = time.time()
+            if now >= deadline:
+                for leg in legs:
+                    leg.cancel("timeout")
+                return None, ("timeout", "", "no approval within %ds (Touch ID or iPhone)" % window)
+            live = [x for x in legs if x.live]
+            if not live:
+                if touch is not None and touch.error and phone is None:
+                    return None, ("auth-failed", touch.error, touch.error)  # today's error
+                return None, ("no-approver", "",
+                              "no approver available (Touch ID unavailable, iPhone not connected)")
+            socks = [x.fileno_or_none() for x in live if x.fileno_or_none() is not None]
+            if socks:
+                select.select(socks, [], [], 0.1)
+            else:
+                time.sleep(0.1)
+            now = time.time()
+            if now >= deadline:
+                continue
+            for leg in live:
+                d = leg.poll(now)
+                if d is None:
+                    continue
+                if d["kind"] == "unavailable":
+                    notes.append("%s-unavailable:%s" % (leg.name, d["why"]))
+                    continue
+                rec["approver"] = d["approver"]
+                other = [x for x in legs if x is not leg]
+                if leg is touch:
+                    reason = "touchid_approved" if d["kind"] == "approve" else "touchid_denied"
+                    for x in other:
+                        x.cancel(reason)
+                    if d["kind"] == "deny":
+                        return None, ("denied", "by=touchid", touch.error)
+                    return touch.token()[0], None
+                for x in other:  # the phone decided: stop the Touch ID prompt first
+                    x.cancel("phone_decided")
+                if d["kind"] == "deny":
+                    detail = "by=%s" % d["approver"] + ("" if d["why"] == "phone-deny" else " outcome=" + d["why"])
+                    err = "denied on iPhone" if d["why"] == "phone-deny" else \
+                        "iPhone approval rejected (%s)" % d["why"]
+                    return None, ("denied", detail, err)
+                token, err = leg.token()
+                if err:
+                    return None, ("auth-failed", err, err)
+                return token, None
+    finally:  # exceptions included: never leave a prompt up or the daemon waiting
+        for leg in (phone, touch):
+            if leg is not None and leg.live:
+                leg.cancel("broker_error")
 
 
 # ------------------------------------------------------- who is asking
@@ -351,16 +922,20 @@ def handle(req, peer_pid):
             return reject("value larger than %d bytes" % MAX_VALUE)
         if not isinstance(note, str) or len(note) > 1000:
             return reject("note longer than 1000 chars")
+        if approvers_of(c) is None:
+            return reject("bad approvers config")
         if dry:
             rec.update(result="DRYRUN-ok")
             log(rec)
             return {"ok": True, "id": "dryrun", "action": "dry-run"}
-        notify("Touch ID: save %s" % key, "%s → %s [%s]" % (who, project, via), c)
-        token, err = decrypt_token(c["write_token"], c)
-        if err:
-            rec.update(result="auth-failed", detail=err)
+        token, fail = approve_gate(c, rec, c["write_token"], "Touch ID: save %s" % key,
+                                   "%s → %s [%s]" % (who, project, via),
+                                   dict(op="save", key=key, summary="save %s → %s" % (key, project),
+                                        project=project, token=c["write_token"], host=host, caller=caller, via=via))
+        if fail:
+            rec.update(result=fail[0], detail=fail[1])
             log(rec)
-            return {"ok": False, "error": err}
+            return {"ok": False, "error": fail[2]}
         code, out, err = run_bws(["--output", "json", "project", "list"], token, c)
         try:
             projects = json.loads(out) if code == 0 else None
@@ -417,16 +992,22 @@ def handle(req, peer_pid):
             return reject("refused: only read-only bws calls (project list/get, secret list/get, -o json)")
         args, summary = v
         rec["detail"] = summary
+        if approvers_of(c) is None:
+            return reject("bad approvers config")
         if dry:
             rec.update(result="DRYRUN-ok")
             log(rec)
             return {"ok": True, "exit": 0, "stdout_b64": base64.b64encode(b"[]").decode()}
-        notify("Touch ID: %s" % summary, "%s [%s]" % (who, via), c)
-        token, err = decrypt_token(tname, c)
-        if err:
-            rec.update(result="auth-failed", detail=err)
+        pos = args[4:] if args[2:3] == ["--server-url"] else args[2:]
+        project = c["project_names"].get(pos[2].lower(), pos[2]) \
+            if len(pos) == 3 and pos[:2] in (["secret", "list"], ["project", "get"]) else ""
+        token, fail = approve_gate(c, rec, tname, "Touch ID: %s" % summary, "%s [%s]" % (who, via),
+                                   dict(op="bws", key="", summary=summary, project=project, token=tname,
+                                        host=host, caller=caller, via=via))
+        if fail:
+            rec.update(result=fail[0], detail=fail[1] or summary)
             log(rec)
-            return {"ok": False, "error": err}
+            return {"ok": False, "error": fail[2]}
         code, out, err = run_bws(args, token, c)
         del token
         rec["result"] = "exit=%d" % code
@@ -636,17 +1217,38 @@ def cmd_init(argv):
     if os.path.exists(IDENTITY):
         print("identity exists: %s" % IDENTITY)
     else:
-        plugin = find_tool("age-plugin-se", "")
+        plugin = find_tool("age-plugin-se", load_config().get("age_plugin_se_path"))
         if not plugin:
             die("age-plugin-se not found (brew install age age-plugin-se)")
         subprocess.run([plugin, "keygen", "--access-control", ac, "-o", IDENTITY], check=True,
                        stdout=subprocess.DEVNULL)
         os.chmod(IDENTITY, 0o600)
         print("created Secure Enclave identity (%s): %s" % (ac, IDENTITY))
-    plugin = find_tool("age-plugin-se", "")
+    plugin = find_tool("age-plugin-se", load_config().get("age_plugin_se_path"))
     subprocess.run([plugin, "recipients", "-i", IDENTITY, "-o", RECIPIENT], check=True)
     os.chmod(RECIPIENT, 0o600)
     print("recipient: %s" % open(RECIPIENT).read().strip())
+
+
+def encrypt_to(age, recipient_file, token, dest):
+    """age-encrypt token (stdin only, never argv) to dest.tmp, 0600, rename. Returns an error or ""."""
+    os.makedirs(TOKENS_DIR, exist_ok=True)
+    tmp = dest + ".tmp"
+    old = os.umask(0o077)
+    try:
+        r = subprocess.run([age, "-R", recipient_file, "-o", tmp], input=token.encode(), env=tool_env(),
+                           capture_output=True)
+    finally:
+        os.umask(old)
+    if r.returncode != 0:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return r.stderr.decode("utf-8", "replace")[:200] or "exit %d" % r.returncode
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dest)
+    return ""
 
 
 def cmd_store(argv):
@@ -668,32 +1270,35 @@ def cmd_store(argv):
     age = find_tool("age", load_config().get("age_path"))
     if not age:
         die("age not found (brew install age age-plugin-se)")
-    os.makedirs(TOKENS_DIR, exist_ok=True)
     dest = token_path(name)
-    tmp = dest + ".tmp"
-    old = os.umask(0o077)
-    try:
-        r = subprocess.run([age, "-R", RECIPIENT, "-o", tmp], input=token.encode(), env=tool_env(),
-                           capture_output=True)
-    finally:
-        os.umask(old)
-    del token
-    if r.returncode != 0:
-        die("age encrypt failed: " + r.stderr.decode("utf-8", "replace")[:200])
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, dest)
+    err = encrypt_to(age, RECIPIENT, token, dest)
+    if err:
+        del token
+        die("age encrypt failed: " + err)
     log({"op": "store", "result": "ok", "token": name})
     print("stored token '%s' -> %s (decrypting it needs Touch ID)" % (name, dest))
+    if os.path.exists(RECIPIENT_IPHONE):  # already holding the plaintext: no extra prompt
+        err = encrypt_to(age, RECIPIENT_IPHONE, token, iphone_token_path(name))
+        if err:
+            del token
+            die("iPhone copy: age encrypt failed: " + err)
+        log({"op": "store", "result": "ok", "token": name, "detail": "iphone copy"})
+        print("stored iPhone copy -> %s (no biometry; used only after a verified iPhone approval)"
+              % iphone_token_path(name))
+    del token
 
 
 def cmd_delete(argv):
     if len(argv) != 1:
         die("usage: bws-touchid delete NAME", 2)
-    p = token_path(argv[0])
-    if os.path.exists(p):
-        os.remove(p)
+    found = False
+    for path in (token_path(argv[0]), iphone_token_path(argv[0])):
+        if os.path.exists(path):
+            os.remove(path)
+            found = True
+            print("deleted %s" % path)
+    if found:
         log({"op": "delete", "result": "ok", "token": argv[0]})
-        print("deleted %s" % p)
     else:
         print("no token named %s" % argv[0])
 
@@ -701,7 +1306,8 @@ def cmd_delete(argv):
 def cmd_status(_argv):
     c = load_config()
     print("identity:  %s" % (IDENTITY if os.path.exists(IDENTITY) else "absent (client-only host)"))
-    toks = sorted(f[:-4] for f in os.listdir(TOKENS_DIR) if f.endswith(".age")) if os.path.isdir(TOKENS_DIR) else []
+    files = os.listdir(TOKENS_DIR) if os.path.isdir(TOKENS_DIR) else []
+    toks = sorted(f[:-4] for f in files if f.endswith(".age") and not f.endswith(".iphone.age"))
     print("tokens:    %s" % (", ".join(toks) or "none"))
     reach = "unreachable"
     for p in socket_order(c):
@@ -715,6 +1321,29 @@ def cmd_status(_argv):
         print("           local_broker=false: this Mac's broker.sock is never used")
     print("config:    %s" % (CONFIG_PATH if os.path.exists(CONFIG_PATH) else "defaults"))
     print("log:       %s" % LOG_PATH)
+    a = approvers_of(c)
+    print("approvers: %s" % (", ".join(a) if a else "BAD CONFIG %r (every gated op is refused)" % (c.get("approvers"),)))
+    ident = iphone_identity(c)
+    print("iphone id: %s" % (ident if os.path.exists(ident) else "absent (bws-touchid iphone-setup)"))
+    copies = sorted(f[:-len(".iphone.age")] for f in files if f.endswith(".iphone.age"))
+    print("iphone tokens: %s" % (", ".join(copies) or "none"))
+    pins = pinned_devices(c)
+    for d in pins:
+        der, why = load_pin(c, d)
+        print("pinned:    %s %s" % (d, display_fp(der) if der else "REFUSED: " + why))
+    if not pins:
+        print("pinned:    none (bws-touchid approver add)")
+    sock = expand(c.get("approvals_socket") or "")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(PHONE_CONNECT_S)
+    try:
+        s.connect(sock)
+        ok = "accepts connections"
+    except (OSError, socket.timeout):
+        ok = "not reachable"
+    finally:
+        s.close()
+    print("approvals.sock: %s (%s)" % (ok, sock))
 
 
 def cmd_run(argv):
@@ -774,6 +1403,137 @@ def cmd_ping(argv):
             print("ok %s (%s)" % (p, r.get("broker_name", "?")))
             sys.exit(0)
     die(not_connected(c, [p.replace(HOME, "~") for p in paths]), 3)
+
+
+# ------------------------------------------------------- iPhone approver admin
+
+def write_private(path, data, dir_mode=0o700):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, dir_mode)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def cmd_approver(argv):
+    c = load_config()
+    sub = argv[0] if argv else ""
+    if sub == "list":
+        pins = pinned_devices(c)
+        for d in pins:
+            der, why = load_pin(c, d)
+            print("%s  %s" % (d, display_fp(der) if der else "REFUSED: " + why))
+        if not pins:
+            print("no pinned iPhone approvers in %s" % approvers_dir(c))
+        log({"op": "approver-list", "result": "ok", "detail": "%d pinned" % len(pins)})
+        return
+    if sub == "remove" and len(argv) == 2:
+        dev = argv[1]
+        if not DEVICE_RE.match(dev):
+            die("device id must match ^dev_[a-z2-7]{24}$", 2)
+        path = os.path.join(approvers_dir(c), dev + ".pub")
+        if os.path.lexists(path):
+            os.remove(path)
+            log({"op": "approver-remove", "result": "ok", "detail": dev})
+            print("removed %s" % dev)
+        else:
+            log({"op": "approver-remove", "result": "absent", "detail": dev})
+            print("no pin for %s" % dev)
+        return
+    if sub == "add" and len(argv) == 3:
+        dev, pem = argv[1], argv[2]
+        if not DEVICE_RE.match(dev):
+            die("device id must match ^dev_[a-z2-7]{24}$", 2)
+        try:
+            with open(expand(pem)) as f:
+                der = spki_from_pem(f.read(8192))
+        except (OSError, UnicodeDecodeError) as e:
+            die("cannot read %s: %s" % (pem, e))
+        if not der:
+            die("%s is not a P-256 public key PEM (SPKI)" % pem)
+        shown = display_fp(der)
+        print("device:      %s" % dev)
+        print("fingerprint: %s   (compare with the approve fingerprint on the phone)" % shown)
+        sys.stdout.write("Type the last 4 characters shown on the phone: ")
+        sys.stdout.flush()
+        typed = (sys.stdin.readline() or "").strip().lower().replace("-", "")
+        if typed != shown.replace("-", "")[-4:]:
+            log({"op": "approver-add", "result": "rejected", "detail": "%s fingerprint mismatch" % dev})
+            die("fingerprint mismatch; nothing pinned")
+        notify("Touch ID: pin iPhone approver", "%s %s" % (dev, shown), c)
+        token, err = decrypt_token(c["read_token"], c)  # owner presence; the token is discarded
+        if err:
+            log({"op": "approver-add", "result": "auth-failed", "detail": dev})
+            die(err)
+        del token
+        path = os.path.join(approvers_dir(c), dev + ".pub")
+        write_private(path, pem_from_spki(der))
+        log({"op": "approver-add", "result": "ok", "detail": "%s fp=%s" % (dev, fingerprint(der))})
+        print("pinned %s -> %s" % (dev, path))
+        if "iphone" not in (approvers_of(c) or []):
+            print('next: set "approvers": ["touchid", "iphone"] in %s and restart the broker' % CONFIG_PATH)
+        return
+    die("usage: bws-touchid approver add DEVICE_ID PEM | list | remove DEVICE_ID", 2)
+
+
+def cmd_iphone_setup(_argv):
+    """One-time (owner, two Touch IDs): a no-biometry Secure Enclave identity and an iPhone copy of each
+    token, so a phone-signed approval can be served without Touch ID (PROTOCOL.md §11.5)."""
+    c = load_config()
+    if not os.path.exists(IDENTITY):
+        die("no Touch ID identity yet: run bws-touchid init and store the tokens first")
+    plugin = find_tool("age-plugin-se", c.get("age_plugin_se_path"))
+    age = find_tool("age", c.get("age_path"))
+    if not plugin or not age:
+        die("age / age-plugin-se not found (brew install age age-plugin-se)")
+    ident = iphone_identity(c)
+    os.makedirs(os.path.dirname(ident), exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        if os.path.exists(ident):
+            print("iphone identity exists: %s" % ident)
+        else:
+            subprocess.run([plugin, "keygen", "--access-control", "none", "-o", ident], check=True,
+                           stdout=subprocess.DEVNULL, env=tool_env())
+            os.chmod(ident, 0o600)
+            print("created no-biometry Secure Enclave identity: %s" % ident)
+        subprocess.run([plugin, "recipients", "-i", ident, "-o", RECIPIENT_IPHONE], check=True,
+                       stdout=subprocess.DEVNULL, env=tool_env())
+        os.chmod(RECIPIENT_IPHONE, 0o600)
+    finally:
+        os.umask(old)
+    done = []
+    for name in dict.fromkeys([c["read_token"], c["write_token"]]):
+        if not os.path.isfile(token_path(name)):
+            print("skip '%s': no Touch ID token stored (bws-touchid store %s)" % (name, name))
+            continue
+        print("Touch ID for token '%s'…" % name)
+        notify("Touch ID: iPhone copy of token '%s'" % name, "bws-touchid iphone-setup", c)
+        token, err = decrypt_token(name, c)
+        if err:
+            log({"op": "iphone-setup", "result": "auth-failed", "token": name})
+            die(err)
+        err = encrypt_to(age, RECIPIENT_IPHONE, token, iphone_token_path(name))
+        del token
+        if err:
+            die("age encrypt failed: " + err)
+        log({"op": "iphone-setup", "result": "ok", "token": name})
+        done.append(name)
+        print("wrote %s" % iphone_token_path(name))
+    print("""
+iPhone copies: %s
+Next:
+  1. whispera-link pair                      (scan the QR with the Whispera app)
+  2. bws-touchid approver add <device_id> ~/.whispera-link/keys/<device_id>.approve.pem
+  3. set "approvers": ["touchid", "iphone"] in %s
+  4. launchctl kickstart -k gui/$(id -u)/bws-touchid.broker
+Threat note: the iPhone identity has no biometry, so a process running as you on this Mac can decrypt
+the .iphone.age copies directly. The phone signature protects the broker path, not those files.""" % (
+        ", ".join(done) or "none", CONFIG_PATH))
 
 
 # ---------------------------------------------------------------- tunnels
@@ -945,7 +1705,7 @@ def main():
         return cmd_gated(argv)
     cmds = {"init": cmd_init, "store": cmd_store, "status": cmd_status, "delete": cmd_delete,
             "run": cmd_run, "serve": cmd_serve, "reap": cmd_reap, "save": cmd_save, "gated": cmd_gated,
-            "ping": cmd_ping, "tunnel": cmd_tunnel}
+            "ping": cmd_ping, "tunnel": cmd_tunnel, "approver": cmd_approver, "iphone-setup": cmd_iphone_setup}
     if not argv or argv[0] not in cmds:
         print(__doc__.strip())
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
