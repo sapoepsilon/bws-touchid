@@ -1,0 +1,71 @@
+{
+  "_comment": "Throwaway test keys generated for these vectors only. ECDSA signatures are randomized: implementations must VERIFY these signatures, not reproduce them. Copied from whispera-link docs/vectors/v1.json; the `approval` vector's host/via/broker strings were replaced with neutral names and re-signed with the same throwaway approve key (see `_sanitized`).",
+  "prefix_spki_p256_hex": "3059301306072a8648ce3d020106082a8648ce3d030107034200",
+  "link": {
+    "private_pkcs8_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwQIPeO/FveQQ7E+F\nlon6vlwRiljPa6uYMytuYmpAIq2hRANCAATUQT+JMXiNM20WXTUJLZqEMd/9Pcke\noZDuXOIWn1AYkuUPFU1IV+VOqQgQ7OPURUOSQJ3seTM6+hnzhHv/JN0u\n-----END PRIVATE KEY-----\n",
+    "public_x963_b64": "BNRBP4kxeI0zbRZdNQktmoQx3/09yR6hkO5c4hafUBiS5Q8VTUhX5U6pCBDs49RFQ5JAnex5Mzr6GfOEe/8k3S4=",
+    "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1EE/iTF4jTNtFl01CS2ahDHf/T3JHqGQ7lziFp9QGJLlDxVNSFflTqkIEOzj1EVDkkCd7HkzOvoZ84R7/yTdLg==",
+    "fingerprint": "6dfed3738678b56bf8dab366833ef01ef791b004765ad36992fd7e5a532af9b6"
+  },
+  "approve": {
+    "private_pkcs8_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiaRnnMWNFVyQa8D0\nOmWAq/VQDsql8IKuflqG46XiiiOhRANCAARWHYcfs6PggV/eEnIol1m9GoIluxUm\nwiE73I4UhWD30YF3hnwKDr2HrCLQnXbDeE/jj+CGPsKI7BvLcLip1wzv\n-----END PRIVATE KEY-----\n",
+    "public_x963_b64": "BFYdhx+zo+CBX94SciiXWb0agiW7FSbCITvcjhSFYPfRgXeGfAoOvYesItCddsN4T+OP4IY+wojsG8twuKnXDO8=",
+    "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVh2HH7Oj4IFf3hJyKJdZvRqCJbsVJsIhO9yOFIVg99GBd4Z8Cg69h6wi0J12w3hP44/ghj7CiOwby3C4qdcM7w==",
+    "fingerprint": "671cee6c7cfe0523b4359d9177db74c7cd6fd3a96fe7515bd97e67d8709f1f5e"
+  },
+  "daemon": {
+    "private_pkcs8_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgfkeoQcTJYgHDvefN\nJhJGdtzV+ksrHHcYzHanvsmawoGhRANCAAScArTMacASkKqwa1CNA6JyTMyxoNgm\nMHCczPD1R6VFEfH6XZAnyMpv9avRoPByeWqwv3nMCERuquRdyaRjLZEk\n-----END PRIVATE KEY-----\n",
+    "public_x963_b64": "BJwCtMxpwBKQqrBrUI0DonJMzLGg2CYwcJzM8PVHpUUR8fpdkCfIym/1q9Gg8HJ5arC/ecwIRG6q5F3JpGMtkSQ=",
+    "spki_der_b64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEnAK0zGnAEpCqsGtQjQOickzMsaDYJjBwnMzw9UelRRHx+l2QJ8jKb/Wr0aDwcnlqsL95zAhEbqrkXcmkYy2RJA==",
+    "fingerprint": "087b057a375919bcae4ea650da18850dd4db7d684f448bd654d7bbcc97ab1af7"
+  },
+  "request_auth": {
+    "device_id": "dev_aaaaaaaaaaaaaaaaaaaaaaaa",
+    "method": "POST",
+    "path": "/v1/agents/w3%3Ap1/prompt",
+    "body_utf8": "{\"text\":\"run the tests\"}",
+    "body_sha256_hex": "51b365c654de71c69dac5afdc09dbbf06929ef6137ee7878f32937071d2923a8",
+    "timestamp": "1791158400",
+    "nonce": "q2Vh8m0Zr8G0xk3p1n9Yxw",
+    "string_to_sign_utf8": "WL1\nPOST\n/v1/agents/w3%3Ap1/prompt\n51b365c654de71c69dac5afdc09dbbf06929ef6137ee7878f32937071d2923a8\n1791158400\nq2Vh8m0Zr8G0xk3p1n9Yxw\ndev_aaaaaaaaaaaaaaaaaaaaaaaa",
+    "signature_der_b64": "MEYCIQCfpVEbuRHEeE9aZfatlqcgERREAZLKJRWV/hBAfgGs5wIhALwHmNEVhWdC3kTwBSEKAZR90bt5NKoVse3UwsJjGu4B"
+  },
+  "empty_body_sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "approval": {
+    "request": {
+      "v": 1,
+      "request_id": "apr_bbbbbbbbbbbbbbbbbbbbbbbb",
+      "nonce": "Zm9vYmFyYmF6cXV4MTIzNA",
+      "op": "bws",
+      "key": "",
+      "summary": "read secret 3f1c2a9b…",
+      "project": "",
+      "token": "read",
+      "host": "build-box",
+      "caller": "claude mcp",
+      "via": "ssh session to build-box",
+      "broker": "Alice's MacBook — test",
+      "created_at": 1791158400,
+      "expires_at": 1791158500
+    },
+    "canonical_utf8": "{\"broker\":\"Alice's MacBook \\u2014 test\",\"caller\":\"claude mcp\",\"created_at\":1791158400,\"expires_at\":1791158500,\"host\":\"build-box\",\"key\":\"\",\"nonce\":\"Zm9vYmFyYmF6cXV4MTIzNA\",\"op\":\"bws\",\"project\":\"\",\"request_id\":\"apr_bbbbbbbbbbbbbbbbbbbbbbbb\",\"summary\":\"read secret 3f1c2a9b\\u2026\",\"token\":\"read\",\"v\":1,\"via\":\"ssh session to build-box\"}",
+    "canonical_b64": "eyJicm9rZXIiOiJBbGljZSdzIE1hY0Jvb2sgXHUyMDE0IHRlc3QiLCJjYWxsZXIiOiJjbGF1ZGUgbWNwIiwiY3JlYXRlZF9hdCI6MTc5MTE1ODQwMCwiZXhwaXJlc19hdCI6MTc5MTE1ODUwMCwiaG9zdCI6ImJ1aWxkLWJveCIsImtleSI6IiIsIm5vbmNlIjoiWm05dlltRnlZbUY2Y1hWNE1USXpOQSIsIm9wIjoiYndzIiwicHJvamVjdCI6IiIsInJlcXVlc3RfaWQiOiJhcHJfYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic3VtbWFyeSI6InJlYWQgc2VjcmV0IDNmMWMyYTliXHUyMDI2IiwidG9rZW4iOiJyZWFkIiwidiI6MSwidmlhIjoic3NoIHNlc3Npb24gdG8gYnVpbGQtYm94In0=",
+    "signed_message_b64": "V0wxLUFQUFJPVkUKeyJicm9rZXIiOiJBbGljZSdzIE1hY0Jvb2sgXHUyMDE0IHRlc3QiLCJjYWxsZXIiOiJjbGF1ZGUgbWNwIiwiY3JlYXRlZF9hdCI6MTc5MTE1ODQwMCwiZXhwaXJlc19hdCI6MTc5MTE1ODUwMCwiaG9zdCI6ImJ1aWxkLWJveCIsImtleSI6IiIsIm5vbmNlIjoiWm05dlltRnlZbUY2Y1hWNE1USXpOQSIsIm9wIjoiYndzIiwicHJvamVjdCI6IiIsInJlcXVlc3RfaWQiOiJhcHJfYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwic3VtbWFyeSI6InJlYWQgc2VjcmV0IDNmMWMyYTliXHUyMDI2IiwidG9rZW4iOiJyZWFkIiwidiI6MSwidmlhIjoic3NoIHNlc3Npb24gdG8gYnVpbGQtYm94In0=",
+    "signature_der_b64": "MEQCIGukwH0eU+vYgsCcqkEpXROK8ISOKz7kmwM3enonC8VDAiBTyQpSuWmk5Xgp3GoNToQJghpsAIVwM5/CLD6UEMO3ag==",
+    "device_id": "dev_aaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "pairing": {
+    "code": "K7QM2XPR",
+    "daemon_fp": "087b057a375919bcae4ea650da18850dd4db7d684f448bd654d7bbcc97ab1af7",
+    "proof_message_utf8": "WL1-PAIR-PROOF\nK7QM2XPR\n087b057a375919bcae4ea650da18850dd4db7d684f448bd654d7bbcc97ab1af7\n97b63f516898589e6bde2a301fac83aab2d58b097794c236f5b89214145e6afa",
+    "proof_der_b64": "MEYCIQCCeUScWBJtNOIznma1ed5kBF7DRf0IxpsQhr1xAmekHQIhAO01rUAwZWbCMadL6eOgV9LEE3gT4rnJ4nqkhzserUra",
+    "approve_proof_message_utf8": "WL1-PAIR-APPROVE\nK7QM2XPR\n087b057a375919bcae4ea650da18850dd4db7d684f448bd654d7bbcc97ab1af7",
+    "approve_proof_der_b64": "MEYCIQDvXyuDtfCqWf4qlM6niOhqb8fikUOxhKOq6vqMTLPq0wIhAIy/2O7k+byhfd4Br923pc1ubFe5iZz2X8Hy0eu6rxbP"
+  },
+  "pair_response_sig": {
+    "body_utf8": "{\"device_id\":\"dev_aaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    "message_utf8": "WL1-PAIR-RESP\nede1ebad2da8ab2ce890a7a6976fc4009514ca339531a397b65fb46c83522960",
+    "signature_der_b64": "MEUCICffAXxjJJK2e3tRwLYkCylYVDVlxKsamv77U1rGZ+XeAiEA7go51rEazeymPZcbgfZs9BHbQhAJr3ZKEWfipsKiUd0="
+  },
+  "_sanitized": "approval.request host/via/broker changed from the upstream file; canonical/signed bytes and signature regenerated with approve.private_pkcs8_pem via /usr/bin/openssl. tests also check the upstream file when ../whispera-link is checked out."
+}
