@@ -131,6 +131,51 @@ hosts only `broker_name` and `local_broker` are used.
 | `local_broker` | clients: `false` = never use this Mac's own `broker.sock`, only `fwd.sock` (default `true`) |
 | `tunnels` | broker Mac: hosts that get a persistent tunnel, `"alias"` or `{"host", "remote_sock"}` |
 | `tunnel_ssh_options` | extra `-o` options for the tunnels, e.g. `["ConnectTimeout=5"]` |
+| `approvers` | who may approve a gated op: `["touchid"]` (default, unchanged behaviour), `["touchid","iphone"]` (race), `["iphone"]` (lid-closed). Anything else refuses every save/read |
+| `approvals_socket` | the whispera-link daemon's socket (default `~/.whispera-link/approvals.sock`) |
+| `approvers_dir` | pinned iPhone approve keys, `<device_id>.pub` (default `~/.bws-broker/approvers`) |
+| `iphone_token_identity` | no-biometry identity for the iPhone token copies (default `<conf dir>/identity-iphone.txt`) |
+| `phone_window_s` | how long the phone may answer, clamped 30–110 (default 100) |
+
+## iPhone approver (optional)
+
+With the whispera-link daemon running on the broker Mac and the Whispera iPhone app
+paired to it, every save/read can be approved either with Touch ID on the Mac or with Face ID on the phone,
+whichever answers first (whispera-link `docs/PROTOCOL.md` §7, §8, §11):
+
+- The broker builds a canonical request (op, key, summary, project, token, host, caller, via, broker, times,
+  random nonce, `request_id`) and sends it to the daemon over `approvals_socket`. The daemon only relays it.
+- The phone signs `WL1-APPROVE\n` + those exact bytes with a Secure Enclave key that needs Face ID. The
+  broker verifies the signature itself with `/usr/bin/openssl` against the key pinned in
+  `approvers/<device_id>.pub`; a bad signature, unknown device, or expired request is a **deny**.
+- At the same time the Touch ID decrypt runs as before (notification text ends in "— or approve on iPhone").
+  Whichever leg answers first wins; the other is cancelled (the Touch ID sheet is killed). A deny from either
+  leg is a deny; no answer within 120 s is a deny.
+- A phone approval decrypts `tokens/<name>.iphone.age` with a second Secure Enclave identity that has **no
+  biometry**; it never falls back to the Touch ID copy.
+- Daemon not running, no paired device, or no ack within 2 s: the iPhone leg is skipped and Touch ID works
+  exactly as before (the log line says `iphone-unavailable:<why>`).
+- Log lines gain `approver=touchid|iphone:<device_id>|none` and `request_id=apr_…`; results `denied`,
+  `timeout`, `no-approver`.
+
+Setup (two Touch IDs, once):
+
+```bash
+bws-touchid iphone-setup                  # identity-iphone.txt + tokens/<read,write>.iphone.age
+whispera-link pair                        # scan the QR with the Whispera app
+bws-touchid approver add <device_id> ~/.whispera-link/keys/<device_id>.approve.pem   # one Touch ID
+# set "approvers": ["touchid", "iphone"] in ~/.config/bws-touchid/config.json, then
+launchctl kickstart -k gui/$(id -u)/bws-touchid.broker
+bws-touchid status                        # approvers, pinned devices, iphone copies, approvals.sock
+```
+
+`bws-touchid approver list` shows pinned devices and fingerprints; `approver remove <device_id>` unpins one
+(no Touch ID). `bws-touchid store NAME` also writes the iPhone copy once `iphone-setup` has run.
+
+**Trade-off you accept with the iPhone approver:** the iPhone identity has no biometry, so any process
+running as you on the Mac can decrypt the `.iphone.age` copies directly, without the broker and without
+either prompt. The phone signature protects the broker path, not those files. Without `iphone-setup` (the
+default) nothing changes: every token copy needs Touch ID.
 
 ## Threat model and limits
 
@@ -158,6 +203,16 @@ What it does not:
   host it came from. Only add tunnels to hosts whose requests you are willing to see at any hour.
 - Losing the Mac's Secure Enclave key (new Mac, reset) means re-storing the tokens; the `.age` files are
   useless elsewhere.
+
+## Tests
+
+```bash
+python3 -m unittest -v      # temp HOME, fake age / age-plugin-se / bws, fake approvals socket; ~40 s
+```
+
+No Secure Enclave, real token, Touch ID prompt or Bitwarden call is involved. The P-256 keys in
+`tests/fakes/vectors_v1.json` (whispera-link's known-answer vectors) and the ones the tests generate are
+throwaway test keys.
 
 Requires macOS with a Secure Enclave and Touch ID, Python 3.9+ (`/usr/bin/python3`), `age`,
 `age-plugin-se` and `bws` on the broker Mac. Clients need only Python.
