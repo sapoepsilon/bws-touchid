@@ -18,8 +18,9 @@ Commands (also reachable through the bws-save / bws-gated symlinks):
   bws-touchid tunnel install|status|uninstall         persistent ssh -R tunnels to the hosts in `tunnels`
   bws-touchid approver add DEVICE_ID PEM | list | remove DEVICE_ID   pin an iPhone approve key
   bws-touchid iphone-setup                            one-time: no-biometry identity + iPhone token copies
-  bws-save [--project P] [--note N] [--dry-run] KEY   VALUE on stdin -> broker -> bws secret create/edit
-  bws-gated <bws args>                                read-only bws through the broker (drop-in BWS_BIN)
+  bws-touchid ticket wait|get TICKET [--timeout S]    collect the result of an --async request
+  bws-save [--async] [--project P] [--note N] [--dry-run] KEY   VALUE on stdin -> broker -> provider save
+  bws-gated [--async] <bws args>                      read-only bws through the broker (drop-in BWS_BIN)
 
 Python 3.9 standard library only. See README.md for the threat model.
 """
@@ -40,6 +41,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HOME = os.path.expanduser("~")
@@ -67,13 +69,30 @@ EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local"
 # Approvers (whispera-link protocol v1, PROTOCOL.md §7, §8, §11). Module constants so tests can shrink them.
 KNOWN_APPROVERS = ("touchid", "iphone")
 TOUCHID_WINDOW_S = 120          # Touch ID leg deadline (today's decrypt timeout)
-PHONE_WINDOW_MIN, PHONE_WINDOW_MAX = 30, 110
+APPROVAL_WAIT_DEFAULT_S = 300   # how long the iPhone leg may take (approval_wait_s)
+PHONE_WINDOW_MIN, PHONE_WINDOW_MAX = 30, 300
 PHONE_CONNECT_S = 1.0           # approvals.sock connect timeout
 PHONE_ACK_S = 2.0               # wait for approval.ack
 PHONE_GRACE_S = 5               # iphone-only: deadline = expires_at + this
 IPHONE_DECRYPT_S = 10
 KILL_GRACE_S = 1.0
 MAX_DAEMON_LINE = 64 * 1024
+PREFER_DEVICE_FILE = "~/.whispera-link/last_device"   # routing hint written by the helper (optional)
+
+# Budgets, innermost first. Every outer wait covers everything inside it, so a slow approval ends
+# with a coded error from the broker, never a client that gave up first (PROTOCOL.md §11.2).
+BWS_TIMEOUT_S = 60                                    # one provider CLI run
+GATE_MAX_S = PHONE_WINDOW_MAX + PHONE_GRACE_S         # longest approval gate (305 s)
+BROKER_CONN_S = GATE_MAX_S + 3 * BWS_TIMEOUT_S + 10   # a save runs the CLI up to 3 times after approval
+GATE_QUEUE_S = 30                                     # sync request waiting for the one approval slot
+CLIENT_TIMEOUT_S = GATE_QUEUE_S + BROKER_CONN_S + 10  # bws-save / bws-gated read timeout
+MAX_CONNS = 32                                        # concurrent broker connections
+
+# Async tickets: in broker memory only, single retrieval, bound to uid + host + caller.
+TICKET_TTL_S = 600              # a finished result is kept this long, then forgotten
+TICKET_WAIT_MAX_S = 55          # longest ticket.get long-poll (fits inside a 60 s MCP call)
+MAX_TICKETS = 64
+TICKET_RE = re.compile(r"^tkt_[a-z2-7]{24}$")
 OPENSSL = "/usr/bin/openssl"    # absolute path on purpose, never PATH
 SPKI_P256_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
 DEVICE_RE = re.compile(r"^dev_[a-z2-7]{24}$")
@@ -99,7 +118,10 @@ DEFAULTS = {
     "iphone_token_identity": "",              # default: <conf dir>/identity-iphone.txt (no biometry)
     "approvals_socket": "~/.whispera-link/approvals.sock",   # whispera-link daemon (iphone approver)
     "approvers_dir": "~/.bws-broker/approvers",               # pinned approve keys <device_id>.pub
-    "phone_window_s": 100,                    # how long the phone may answer (clamped 30-110)
+    # "approval_wait_s": 300,                 # how long the phone may answer (clamped 30-300);
+    #                                           legacy name "phone_window_s" is still read
+    "prefer_device_file": PREFER_DEVICE_FILE, # last-active device id, forwarded as a routing hint
+    "provider": "bitwarden",                  # secret backend behind the gate (see PROVIDERS below)
     "age_plugin_se_path": "",
 }
 
@@ -214,7 +236,7 @@ def decrypt_token(name, c):
     return tok, None
 
 
-def run_bws(args, token, c, timeout=60):
+def run_bws(args, token, c, timeout=None):
     """Run bws with the token in env only and an empty HOME (no user bws config can redirect it)."""
     bws = find_tool("bws", c.get("bws_path"))
     if not bws:
@@ -222,7 +244,7 @@ def run_bws(args, token, c, timeout=60):
     with tempfile.TemporaryDirectory(prefix="bws-touchid-") as tmp:
         env = {"HOME": tmp, "TMPDIR": tmp + "/", "PATH": "/usr/bin:/bin", "BWS_ACCESS_TOKEN": token}
         try:
-            r = subprocess.run([bws, "--color", "no"] + args, capture_output=True, timeout=timeout,
+            r = subprocess.run([bws, "--color", "no"] + args, capture_output=True, timeout=timeout or BWS_TIMEOUT_S,
                                env=env, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             return 124, b"", "bws timed out"
@@ -260,11 +282,32 @@ def is_default_approvers(c):
 
 
 def phone_window(c):
+    """approval_wait_s (legacy: phone_window_s), default 300, clamped PHONE_WINDOW_MIN-PHONE_WINDOW_MAX."""
+    raw = c.get("approval_wait_s")
+    if raw is None:
+        raw = c.get("phone_window_s")
     try:
-        w = int(c.get("phone_window_s", 100))
+        w = APPROVAL_WAIT_DEFAULT_S if raw is None or isinstance(raw, bool) else int(raw)
     except (TypeError, ValueError):
-        w = 100
+        w = APPROVAL_WAIT_DEFAULT_S
     return max(PHONE_WINDOW_MIN, min(PHONE_WINDOW_MAX, w))
+
+
+def prefer_device_of(req, c):
+    """Routing hint for the daemon: which paired device to push first (the one used last). Only a hint:
+    every approval is still verified against a pinned key. From the request, else the helper's file."""
+    dev = req.get("prefer_device")
+    if isinstance(dev, str) and DEVICE_RE.match(dev):
+        return dev
+    path = expand(c.get("prefer_device_file") or "")
+    if not path or not safe_owned(path, False):
+        return ""
+    try:
+        with open(path) as f:
+            dev = f.read(64).strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return dev if DEVICE_RE.match(dev) else ""
 
 
 def iphone_identity(c):
@@ -484,8 +527,9 @@ class IphoneLeg(Leg):
     """Client of ~/.whispera-link/approvals.sock: one connection per approval (PROTOCOL.md §8)."""
     name = "iphone"
 
-    def __init__(self, c, canon, tname):
+    def __init__(self, c, canon, tname, prefer_device=""):
         self.c, self.canon, self.tname = c, canon, tname
+        self.prefer_device = prefer_device or None
         self.raw = canonical_bytes(canon)
         self.rid = canon["request_id"]
         self.sock, self.buf, self.why, self.device = None, b"", "", ""
@@ -521,7 +565,8 @@ class IphoneLeg(Leg):
             return False
         try:
             req = {"op": "approval.request", "v": 1, "request_id": self.rid,
-                   "canonical_b64": base64.b64encode(self.raw).decode(), "expires_at": self.canon["expires_at"]}
+                   "canonical_b64": base64.b64encode(self.raw).decode(), "expires_at": self.canon["expires_at"],
+                   "prefer_device": self.prefer_device}
             s.sendall(json.dumps(req).encode() + b"\n")
             end = time.time() + PHONE_ACK_S
             line = None
@@ -687,9 +732,13 @@ class IphoneLeg(Leg):
         return (tok, None) if tok else (None, "decrypted iPhone token is empty")
 
 
-def approve_gate(c, rec, tname, title, msg, canon_fields):
+def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
     """Get one approval and the decrypted token. Returns (token, None) or (None, (result, detail, error)).
-    Sets rec approver / request_id / notes for the audit line."""
+    Sets rec approver / request_id / notes for the audit line.
+
+    Deadlines: the Touch ID leg keeps its 120 s; a live iPhone leg may answer until expires_at
+    (created_at + approval_wait_s, default 300) + PHONE_GRACE_S. The gate waits for the later of the
+    legs it actually has, so with the phone unavailable Touch ID behaves exactly as before."""
     if is_default_approvers(c):  # exactly the pre-approver behaviour
         notify(title, msg, c)
         token, err = decrypt_token(tname, c)
@@ -703,15 +752,19 @@ def approve_gate(c, rec, tname, title, msg, canon_fields):
     notes = rec.setdefault("notes", [])
     created = canon["created_at"]
     deadline_touchid = created + TOUCHID_WINDOW_S
-    deadline = deadline_touchid if "touchid" in approvers else canon["expires_at"] + PHONE_GRACE_S
-    window = int(deadline - created)
+    deadline_phone = canon["expires_at"] + PHONE_GRACE_S
     phone = touch = None
     try:
         if "iphone" in approvers:
-            phone = IphoneLeg(c, canon, tname)
+            phone = IphoneLeg(c, canon, tname, prefer_device)
             if not phone.start():
                 notes.append("iphone-unavailable:" + phone.why)
                 phone = None
+        if "touchid" not in approvers:
+            deadline = deadline_phone
+        else:
+            deadline = max(deadline_touchid, deadline_phone) if phone is not None else deadline_touchid
+        window = int(deadline - created)
         if "touchid" in approvers:
             notify(title, msg + (" — or approve on iPhone" if phone else ""), c)
             touch = TouchIdLeg(c, tname, deadline_touchid)
@@ -881,61 +934,82 @@ def scrub(stdout, c):
     return stdout
 
 
-def handle(req, peer_pid):
-    c = load_config()
-    op = req.get("op", "")
-    host = clean(req.get("host"), 48)
-    caller = clean(req.get("caller"), 60)
-    peer_args = ps_field(peer_pid, "args").split()
-    if peer_args and os.path.basename(peer_args[0]) == "ssh":
-        via = "ssh session to " + clean(ssh_destination(peer_args), 40)
-        who = "%s (%s)" % (host or "remote", caller or "?")
-    else:
-        via = "local: " + clean(proc_chain(ps_field(peer_pid, "ppid") or peer_pid), 70)
-        who = caller or "local process"
-    rec = {"op": op, "host": host, "caller": caller, "via": via}
-    dry = bool(req.get("dryrun"))
+# ------------------------------------------------------------ providers
+#
+# The approval gate (approve_gate above) decides WHETHER an op may run and unseals the credential the
+# provider asked for; a Provider decides WHAT runs: which sealed token it needs, how a read request is
+# parsed and summarised for the prompt, and how list / get / save talk to the backend. The gate never
+# sees provider details and a provider never sees approvers. See docs/PROVIDERS.md for adding one.
 
-    def reject(msg):
-        rec.update(result="rejected", detail=msg)
-        log(rec)
-        return {"ok": False, "error": msg}
+class Provider(object):
+    """A secret backend behind the approval gate.
 
-    if op == "ping":
-        return {"ok": True, "broker": "bws-touchid", "broker_name": c["broker_name"]}
+    Token handling: every provider names the sealed credential each operation needs (read_token /
+    write_token; files tokens/<name>.age, plus the .iphone.age copies) and how it is handed to the backend
+    (token_env). The token is decrypted by the gate, used for one op, and dropped.
 
-    if op == "save":
-        key = req.get("key") or ""
-        project = req.get("project") or (c["save_projects"][0] if c["save_projects"] else "")
-        note = req.get("note") or ""
-        value = req.get("value")
-        rec.update(key=key, project=project, token=c["write_token"])
-        if not KEY_RE.match(key):
-            return reject("key must match ^[A-Z0-9_]+$ (max 128)")
-        if denied_key(key, c):
-            return reject("that key prefix is owner-only")
-        if not project or denied_project(project, c) or project not in c["save_projects"]:
-            return reject("project '%s' is not in save_projects %s" % (clean(project, 40), c["save_projects"]))
-        if not isinstance(value, str) or not value:
-            return reject("empty value")
-        if len(value.encode()) > MAX_VALUE:
-            return reject("value larger than %d bytes" % MAX_VALUE)
-        if not isinstance(note, str) or len(note) > 1000:
-            return reject("note longer than 1000 chars")
-        if approvers_of(c) is None:
-            return reject("bad approvers config")
-        if dry:
-            rec.update(result="DRYRUN-ok")
-            log(rec)
-            return {"ok": True, "id": "dryrun", "action": "dry-run"}
-        token, fail = approve_gate(c, rec, c["write_token"], "Touch ID: save %s" % key,
-                                   "%s → %s [%s]" % (who, project, via),
-                                   dict(op="save", key=key, summary="save %s → %s" % (key, project),
-                                        project=project, token=c["write_token"], host=host, caller=caller, via=via))
-        if fail:
-            rec.update(result=fail[0], detail=fail[1])
-            log(rec)
-            return {"ok": False, "error": fail[2]}
+    parse_read(raw, c) -> None (refused) or {"kind": "list"|"get", "args", "summary", "project"}
+    list(op, token, c) / get(op, token, c) -> (exit_code, stdout_bytes, stderr_text)
+    save(key, value, note, project, token, c) -> (result, detail, response_dict)
+    scrub(stdout, c) -> stdout with denied projects / keys removed
+    """
+    name = "?"
+    enabled = False
+    token_env = ""
+
+    def read_token(self, c, requested=None):
+        return requested or c["read_token"]
+
+    def write_token(self, c):
+        return c["write_token"]
+
+    def parse_read(self, raw, c):
+        raise NotImplementedError
+
+    def list(self, op, token, c):
+        raise NotImplementedError
+
+    def get(self, op, token, c):
+        raise NotImplementedError
+
+    def read(self, op, token, c):
+        return (self.list if op["kind"] == "list" else self.get)(op, token, c)
+
+    def save(self, key, value, note, project, token, c):
+        raise NotImplementedError
+
+    def scrub(self, stdout, c):
+        return stdout
+
+
+class BitwardenProvider(Provider):
+    """Bitwarden Secrets Manager through the `bws` CLI (the original and default behaviour)."""
+    name = "bitwarden"
+    enabled = True
+    token_env = "BWS_ACCESS_TOKEN"
+
+    def parse_read(self, raw, c):
+        v = validate_read_args(raw, c)
+        if not v:
+            return None
+        args, summary = v
+        pos = args[4:] if args[2:3] == ["--server-url"] else args[2:]
+        project = c["project_names"].get(pos[2].lower(), pos[2]) \
+            if len(pos) == 3 and pos[:2] in (["secret", "list"], ["project", "get"]) else ""
+        return {"kind": "list" if "list" in pos[1:2] else "get", "args": args, "summary": summary,
+                "project": project}
+
+    def list(self, op, token, c):
+        return run_bws(op["args"], token, c, BWS_TIMEOUT_S)
+
+    get = list  # bws itself tells list from get by its argv
+
+    def scrub(self, stdout, c):
+        return scrub(stdout, c)
+
+    def save(self, key, value, note, project, token, c):
+        def reject(msg):
+            return "rejected", msg, {"ok": False, "error": msg}
         code, out, err = run_bws(["--output", "json", "project", "list"], token, c)
         try:
             projects = json.loads(out) if code == 0 else None
@@ -968,29 +1042,160 @@ def handle(req, peer_pid):
             args += ["--note", note] if note else []
             action = "created"
         code, out, err = run_bws(args, token, c)
-        del token
         if code != 0:
-            rec.update(result="error", detail="bws %s failed exit %d" % (action, code))
-            log(rec)
-            return {"ok": False, "error": "bws failed: " + err.replace(value, "[REDACTED]")}
+            return "error", "bws %s failed exit %d" % (action, code), \
+                {"ok": False, "error": "bws failed: " + err.replace(value, "[REDACTED]")}
         try:
             sid = json.loads(out).get("id", "")
         except (ValueError, AttributeError):
             sid = ""
-        rec.update(result=action, detail="id=%s" % sid)
+        return action, "id=%s" % sid, {"ok": True, "id": sid, "action": action, "project": project}
+
+
+class OnePasswordProvider(Provider):
+    """SKELETON, not enabled: 1Password through `op` with a service account.
+
+    token_env OP_SERVICE_ACCOUNT_TOKEN; tokens/<read_token>.age holds a read-only service account token,
+    tokens/<write_token>.age one that may write the allowed vaults. Planned mapping (docs/PROVIDERS.md):
+      list -> op item list --vault <vault> --format json        (project = vault name)
+      get  -> op item get <id> --vault <vault> --format json     (fields with values)
+      save -> op item edit <id> 'password=<value>' / op item create --category password ...
+    The value would go on argv for op too; prefer a template file on a 0600 fd or stdin (`op item create
+    --template -`) when implementing. Same denied_projects / save_projects rules apply to vault names."""
+    name = "1password"
+    token_env = "OP_SERVICE_ACCOUNT_TOKEN"
+
+
+class KeychainProvider(Provider):
+    """SKELETON, not enabled: the macOS login Keychain through /usr/bin/security.
+
+    Keychain items need no bearer token, so token handling differs: the gate still unseals a token
+    (that decrypt IS the Touch ID approval) and the provider discards it. Planned mapping:
+      list -> security dump-keychain (names only) filtered to a service prefix (project = service prefix)
+      get  -> security find-generic-password -s <service> -a <key> -w
+      save -> security add-generic-password -U -s <service> -a <key> -w (value via stdin prompt, not argv)
+    Items must be created with an ACL that excludes /usr/bin/security for other callers, or any process
+    running as the user can read them silently; see docs/PROVIDERS.md before enabling."""
+    name = "keychain"
+
+
+PROVIDERS = {"bitwarden": BitwardenProvider()}                     # shipped
+PROVIDER_SKELETONS = {"1password": OnePasswordProvider(), "keychain": KeychainProvider()}  # not enabled
+
+
+def provider_of(c):
+    """(provider, None) or (None, why). Unknown and skeleton providers fail closed."""
+    name = c.get("provider") or "bitwarden"
+    p = PROVIDERS.get(name) if isinstance(name, str) else None
+    if p is not None and p.enabled:
+        return p, None
+    if isinstance(name, str) and name in PROVIDER_SKELETONS:
+        return None, "provider '%s' is not enabled in this version" % name
+    return None, "unknown provider %r" % clean(name, 30)
+
+
+# ---------------------------------------------------------------- requests
+
+class Job(object):
+    """A validated gated op that still needs its approval. run() = gate + provider call (+ audit line);
+    it must hold GATE_LOCK. approved is set once the gate let it through."""
+
+    def __init__(self, op, rec, run, reject):
+        self.op, self.rec, self._run, self.reject = op, rec, run, reject
+        self.approved = False
+
+    def run(self):
+        return self._run(self)
+
+
+GATE_LOCK = threading.Lock()   # one approval in flight: one Touch ID sheet / one phone request at a time
+
+
+def prepare(req, peer_pid):
+    """Validate a request. Returns a response dict (ping, rejects, dry runs) or a Job for save / bws."""
+    c = load_config()
+    op = req.get("op", "")
+    host = clean(req.get("host"), 48)
+    caller = clean(req.get("caller"), 60)
+    peer_args = ps_field(peer_pid, "args").split()
+    if peer_args and os.path.basename(peer_args[0]) == "ssh":
+        via = "ssh session to " + clean(ssh_destination(peer_args), 40)
+        who = "%s (%s)" % (host or "remote", caller or "?")
+    else:
+        via = "local: " + clean(proc_chain(ps_field(peer_pid, "ppid") or peer_pid), 70)
+        who = caller or "local process"
+    rec = {"op": op, "host": host, "caller": caller, "via": via}
+    dry = bool(req.get("dryrun"))
+
+    def reject(msg):
+        rec.update(result="rejected", detail=msg)
         log(rec)
-        return {"ok": True, "id": sid, "action": action, "project": project}
+        return {"ok": False, "error": msg}
+
+    if op == "ping":
+        return {"ok": True, "broker": "bws-touchid", "broker_name": c["broker_name"]}
+
+    if op in ("save", "bws"):
+        provider, why = provider_of(c)
+        if provider is None:
+            return reject(why)
+        prefer = prefer_device_of(req, c)
+
+    if op == "save":
+        key = req.get("key") or ""
+        project = req.get("project") or (c["save_projects"][0] if c["save_projects"] else "")
+        note = req.get("note") or ""
+        value = req.get("value")
+        tname = provider.write_token(c)
+        rec.update(key=key, project=project, token=tname)
+        if not KEY_RE.match(key):
+            return reject("key must match ^[A-Z0-9_]+$ (max 128)")
+        if denied_key(key, c):
+            return reject("that key prefix is owner-only")
+        if not project or denied_project(project, c) or project not in c["save_projects"]:
+            return reject("project '%s' is not in save_projects %s" % (clean(project, 40), c["save_projects"]))
+        if not isinstance(value, str) or not value:
+            return reject("empty value")
+        if len(value.encode()) > MAX_VALUE:
+            return reject("value larger than %d bytes" % MAX_VALUE)
+        if not isinstance(note, str) or len(note) > 1000:
+            return reject("note longer than 1000 chars")
+        if approvers_of(c) is None:
+            return reject("bad approvers config")
+        if dry:
+            rec.update(result="DRYRUN-ok")
+            log(rec)
+            return {"ok": True, "id": "dryrun", "action": "dry-run"}
+
+        def run_save(job):
+            token, fail = approve_gate(c, rec, tname, "Touch ID: save %s" % key,
+                                       "%s → %s [%s]" % (who, project, via),
+                                       dict(op="save", key=key, summary="save %s → %s" % (key, project),
+                                            project=project, token=tname, host=host, caller=caller, via=via),
+                                       prefer)
+            if fail:
+                rec.update(result=fail[0], detail=fail[1])
+                log(rec)
+                return {"ok": False, "error": fail[2]}
+            job.approved = True
+            result, detail, resp = provider.save(key, value, note, project, token, c)
+            del token
+            rec.update(result=result, detail=detail)
+            log(rec)
+            return resp
+        return Job("save", rec, run_save, reject)
 
     if op == "bws":
         raw = req.get("args")
-        tname = req.get("token") or c["read_token"]
+        tname = provider.read_token(c, req.get("token"))
         rec["token"] = tname
         if not NAME_RE.match(str(tname)):
             return reject("bad token name")
-        v = validate_read_args(raw, c) if isinstance(raw, list) and all(isinstance(a, str) for a in raw) else None
-        if not v:
+        rop = provider.parse_read(raw, c) \
+            if isinstance(raw, list) and all(isinstance(a, str) for a in raw) else None
+        if not rop:
             return reject("refused: only read-only bws calls (project list/get, secret list/get, -o json)")
-        args, summary = v
+        summary = rop["summary"]
         rec["detail"] = summary
         if approvers_of(c) is None:
             return reject("bad approvers config")
@@ -998,24 +1203,143 @@ def handle(req, peer_pid):
             rec.update(result="DRYRUN-ok")
             log(rec)
             return {"ok": True, "exit": 0, "stdout_b64": base64.b64encode(b"[]").decode()}
-        pos = args[4:] if args[2:3] == ["--server-url"] else args[2:]
-        project = c["project_names"].get(pos[2].lower(), pos[2]) \
-            if len(pos) == 3 and pos[:2] in (["secret", "list"], ["project", "get"]) else ""
-        token, fail = approve_gate(c, rec, tname, "Touch ID: %s" % summary, "%s [%s]" % (who, via),
-                                   dict(op="bws", key="", summary=summary, project=project, token=tname,
-                                        host=host, caller=caller, via=via))
-        if fail:
-            rec.update(result=fail[0], detail=fail[1] or summary)
+
+        def run_read(job):
+            token, fail = approve_gate(c, rec, tname, "Touch ID: %s" % summary, "%s [%s]" % (who, via),
+                                       dict(op="bws", key="", summary=summary, project=rop["project"],
+                                            token=tname, host=host, caller=caller, via=via),
+                                       prefer)
+            if fail:
+                rec.update(result=fail[0], detail=fail[1] or summary)
+                log(rec)
+                return {"ok": False, "error": fail[2]}
+            job.approved = True
+            code, out, err = provider.read(rop, token, c)
+            del token
+            rec["result"] = "exit=%d" % code
             log(rec)
-            return {"ok": False, "error": fail[2]}
-        code, out, err = run_bws(args, token, c)
-        del token
-        rec["result"] = "exit=%d" % code
-        log(rec)
-        return {"ok": code == 0, "exit": code, "stdout_b64": base64.b64encode(scrub(out, c)).decode(),
-                "stderr": err, "error": "" if code == 0 else "bws exited %d" % code}
+            return {"ok": code == 0, "exit": code, "stdout_b64": base64.b64encode(provider.scrub(out, c)).decode(),
+                    "stderr": err, "error": "" if code == 0 else "bws exited %d" % code}
+        return Job("bws", rec, run_read, reject)
 
     return reject("unknown op")
+
+
+def handle(req, peer_pid):
+    """Synchronous request: validate, wait for the approval slot, run. Returns the response dict."""
+    job = prepare(req, peer_pid)
+    if not isinstance(job, Job):
+        return job
+    if not GATE_LOCK.acquire(timeout=GATE_QUEUE_S):
+        return job.reject("broker busy: another approval is pending; retry, or use --async")
+    try:
+        return job.run()
+    finally:
+        GATE_LOCK.release()
+
+
+# ---------------------------------------------------------------- async tickets
+#
+# A caller that cannot wait for an approval (MCP tools are killed at 60 s) sends "async": true and gets
+# {"ticket"} at once; the job runs in the background, one approval at a time like every other request.
+# ticket.get returns pending | approved (with the result) | denied | expired. Results live in this
+# process's memory only (never on disk, never logged), are handed out once, and are dropped
+# TICKET_TTL_S after the job finished. A ticket only answers the uid + host + caller that created it;
+# anything else - unknown, used, expired, someone else's - gets the same "expired" answer.
+
+class Tickets(object):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items = {}
+
+    def _purge(self, now):
+        for tid in [t for t, e in self.items.items() if e["done_at"] and now - e["done_at"] > TICKET_TTL_S]:
+            e = self.items.pop(tid)
+            e["result"] = None
+
+    def create(self, uid, host, caller, op):
+        with self.lock:
+            self._purge(time.time())
+            if len(self.items) >= MAX_TICKETS:
+                return None
+            tid = b32id("tkt")
+            self.items[tid] = {"uid": uid, "host": host, "caller": caller, "op": op, "status": "pending",
+                               "created": time.time(), "done_at": None, "result": None,
+                               "event": threading.Event()}
+            return tid
+
+    def finish(self, tid, status, result):
+        with self.lock:
+            e = self.items.get(tid)
+            if e is None:
+                return
+            e.update(status=status, result=result, done_at=time.time())
+            e["event"].set()
+
+    def get(self, tid, uid, host, caller, wait=0):
+        gone = {"ok": False, "status": "expired",
+                "error": "no such ticket (expired, already collected, or not yours)"}
+        if not isinstance(tid, str) or not TICKET_RE.match(tid):
+            return gone
+        with self.lock:
+            self._purge(time.time())
+            e = self.items.get(tid)
+            if e is None or (e["uid"], e["host"], e["caller"]) != (uid, host, caller):
+                return gone
+            ev = e["event"]
+        if e["status"] == "pending" and wait > 0:
+            ev.wait(min(wait, TICKET_WAIT_MAX_S))
+        with self.lock:
+            if self.items.get(tid) is not e:
+                return gone  # collected by a concurrent ticket.get
+            if e["status"] == "pending":
+                return {"ok": True, "status": "pending", "ticket": tid}
+            del self.items[tid]
+            result, e["result"] = e["result"], None
+        if e["status"] == "approved":
+            return {"ok": True, "status": "approved", "op": e["op"], "result": result}
+        return {"ok": False, "status": "denied", "op": e["op"], "error": (result or {}).get("error") or "denied"}
+
+    def sweep(self):
+        with self.lock:
+            self._purge(time.time())
+
+
+TICKETS = Tickets()
+
+
+def _ticket_worker(job, tid):
+    try:
+        with GATE_LOCK:
+            resp = job.run()
+    except Exception as e:  # noqa: BLE001
+        log({"op": job.op, "result": "error", "detail": "async " + type(e).__name__})
+        resp = {"ok": False, "error": "broker error"}
+    TICKETS.finish(tid, "approved" if job.approved else "denied", resp)
+
+
+def start_async(job, uid):
+    tid = TICKETS.create(uid, job.rec.get("host", ""), job.rec.get("caller", ""), job.op)
+    if tid is None:
+        return job.reject("too many outstanding tickets (%d); collect or let them expire" % MAX_TICKETS)
+    threading.Thread(target=_ticket_worker, args=(job, tid), name="ticket", daemon=True).start()
+    return {"ok": True, "status": "pending", "ticket": tid, "ttl_s": TICKET_TTL_S}
+
+
+def dispatch(req, peer_pid, peer_uid):
+    """Everything the broker socket accepts: ping, save, bws (sync or "async": true), ticket.get."""
+    op = req.get("op", "")
+    if op == "ticket.get":
+        try:
+            wait = max(0.0, min(float(req.get("wait") or 0), TICKET_WAIT_MAX_S))
+        except (TypeError, ValueError):
+            wait = 0.0
+        return TICKETS.get(req.get("ticket"), peer_uid, clean(req.get("host"), 48), clean(req.get("caller"), 60),
+                           wait)
+    if req.get("async") is True and op in ("save", "bws"):
+        job = prepare(req, peer_pid)
+        return start_async(job, peer_uid) if isinstance(job, Job) else job
+    return handle(req, peer_pid)
 
 
 def read_line(conn, limit):
@@ -1031,6 +1355,36 @@ def read_line(conn, limit):
     return None
 
 
+def serve_conn(conn, slots):
+    try:
+        cred = conn.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, 76)
+        peer_uid = struct.unpack_from("Ii", cred)[1]
+        peer_pid = struct.unpack("i", conn.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4))[0]
+        if peer_uid != os.getuid():
+            resp = {"ok": False, "error": "peer uid mismatch"}
+        else:
+            conn.settimeout(15)
+            line = read_line(conn, MAX_LINE)
+            try:
+                req = json.loads(line) if line else None
+            except ValueError:
+                req = None
+            if not isinstance(req, dict):
+                resp = {"ok": False, "error": "bad request (one JSON line)"}
+            else:
+                conn.settimeout(BROKER_CONN_S)
+                resp = dispatch(req, peer_pid, peer_uid)
+                req.clear()
+        conn.sendall(json.dumps(resp).encode() + b"\n")
+    except (OSError, socket.timeout):
+        pass  # status probes and clients that gave up
+    except Exception as e:  # noqa: BLE001
+        log({"op": "serve", "result": "error", "detail": type(e).__name__})
+    finally:
+        conn.close()
+        slots.release()
+
+
 def cmd_serve(_argv):
     os.umask(0o077)
     os.makedirs(SOCK_DIR, exist_ok=True)
@@ -1044,34 +1398,21 @@ def cmd_serve(_argv):
     os.chmod(LOCAL_SOCK, 0o600)
     srv.listen(16)
     log({"op": "serve", "result": "listening", "detail": LOCAL_SOCK})
-    while True:  # serial on purpose: one Touch ID prompt at a time
+
+    def sweeper():
+        while True:
+            time.sleep(30)
+            TICKETS.sweep()
+    threading.Thread(target=sweeper, name="ticket-sweeper", daemon=True).start()
+    slots = threading.BoundedSemaphore(MAX_CONNS)
+    # One thread per connection so ping and ticket.get answer while an approval is pending; approvals
+    # themselves stay serial (GATE_LOCK): one Touch ID prompt at a time.
+    while True:
         conn, _ = srv.accept()
-        try:
-            cred = conn.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, 76)
-            peer_uid = struct.unpack_from("Ii", cred)[1]
-            peer_pid = struct.unpack("i", conn.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4))[0]
-            if peer_uid != os.getuid():
-                resp = {"ok": False, "error": "peer uid mismatch"}
-            else:
-                conn.settimeout(15)
-                line = read_line(conn, MAX_LINE)
-                try:
-                    req = json.loads(line) if line else None
-                except ValueError:
-                    req = None
-                if not isinstance(req, dict):
-                    resp = {"ok": False, "error": "bad request (one JSON line)"}
-                else:
-                    conn.settimeout(150)
-                    resp = handle(req, peer_pid)
-                    req.clear()
-            conn.sendall(json.dumps(resp).encode() + b"\n")
-        except (OSError, socket.timeout):
-            pass  # status probes and clients that gave up
-        except Exception as e:  # noqa: BLE001
-            log({"op": "serve", "result": "error", "detail": type(e).__name__})
-        finally:
+        if not slots.acquire(blocking=False):
             conn.close()
+            continue
+        threading.Thread(target=serve_conn, args=(conn, slots), name="conn", daemon=True).start()
 
 
 # ---------------------------------------------------------------- client
@@ -1106,14 +1447,14 @@ def connect_first(paths):
     return None
 
 
-def broker_call(req):
+def broker_call(req, timeout=None):
     c = load_config()
     order = socket_order(c)
     s = connect_first(order)
     if s is None:
         die(not_connected(c, [p.replace(HOME, "~") for p in order]), 3)
     try:
-        s.settimeout(160)
+        s.settimeout(timeout or CLIENT_TIMEOUT_S)
         s.sendall(json.dumps(req).encode() + b"\n")
         line = read_line(s, MAX_STDOUT * 2)
     except OSError as e:
@@ -1149,10 +1490,13 @@ def read_value(prompt):
 def cmd_save(argv):
     project = note = key = ""
     dry = False
+    asyn = os.environ.get("BWS_TOUCHID_ASYNC") == "1"
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--project", "--note") and i + 1 < len(argv):
+        if a == "--async":
+            asyn, i = True, i + 1
+        elif a in ("--project", "--note") and i + 1 < len(argv):
             if a == "--project":
                 project = argv[i + 1]
             else:
@@ -1161,7 +1505,7 @@ def cmd_save(argv):
         elif a == "--dry-run":
             dry, i = True, i + 1
         elif a in ("-h", "--help"):
-            print('usage: printf %s "$VALUE" | bws-save [--project NAME] [--note TEXT] [--dry-run] KEY')
+            print('usage: printf %s "$VALUE" | bws-save [--async] [--project NAME] [--note TEXT] [--dry-run] KEY')
             sys.exit(0)
         elif a.startswith("-"):
             die("unknown option " + a, 2)
@@ -1180,6 +1524,9 @@ def cmd_save(argv):
         req["project"] = project
     if note:
         req["note"] = note
+    if asyn:
+        req["async"] = True
+        return print_ticket("bws-save", broker_call(req))
     eprint("bws-save: waiting for the owner's Touch ID on %s…" % load_config()["broker_name"])
     r = broker_call(req)
     if r.get("ok"):
@@ -1188,12 +1535,19 @@ def cmd_save(argv):
     die("refused: " + str(r.get("error")), 5)
 
 
-def cmd_gated(argv):
-    req = {"op": "bws", "args": argv, "host": socket.gethostname().split(".")[0], "caller": my_caller(),
-           "dryrun": os.environ.get("BWS_BROKER_DRYRUN") == "1"}
-    if os.environ.get("BWS_TOUCHID_TOKEN"):
-        req["token"] = os.environ["BWS_TOUCHID_TOKEN"]
-    r = broker_call(req)
+def print_ticket(prog, r):
+    """An --async answer: {"ticket": ...} on stdout (exit 0), or the refusal (exit 5)."""
+    if r.get("ok") and r.get("ticket"):
+        print(json.dumps({"ticket": r["ticket"]}))
+        eprint("%s: queued for approval; collect with: bws-touchid ticket wait %s" % (prog, r["ticket"]))
+        sys.exit(0)
+    if r.get("ok"):  # a dry run answers at once
+        print(json.dumps(r))
+        sys.exit(0)
+    die("refused: " + str(r.get("error")), 5)
+
+
+def print_gated(r):
     out = base64.b64decode(r.get("stdout_b64") or "")
     sys.stdout.buffer.write(out)
     sys.stdout.flush()
@@ -1203,6 +1557,62 @@ def cmd_gated(argv):
         eprint("bws-gated: " + str(r.get("error") or "failed"))
         sys.exit(r.get("exit") or 5)
     sys.exit(0)
+
+
+def cmd_gated(argv):
+    asyn = os.environ.get("BWS_TOUCHID_ASYNC") == "1"
+    while argv[:1] == ["--async"]:
+        asyn, argv = True, argv[1:]
+    req = {"op": "bws", "args": argv, "host": socket.gethostname().split(".")[0], "caller": my_caller(),
+           "dryrun": os.environ.get("BWS_BROKER_DRYRUN") == "1"}
+    if os.environ.get("BWS_TOUCHID_TOKEN"):
+        req["token"] = os.environ["BWS_TOUCHID_TOKEN"]
+    if asyn:
+        req["async"] = True
+        return print_ticket("bws-gated", broker_call(req))
+    print_gated(broker_call(req))
+
+
+def cmd_ticket(argv):
+    """ticket wait TICKET [--timeout S]: long-poll until decided (default 50 s, fits a 60 s MCP call);
+    ticket get TICKET: one look. Exit 0 approved (output as bws-gated / bws-save would print it),
+    5 denied, 6 expired / unknown / not yours, 75 still pending."""
+    usage = "usage: bws-touchid ticket wait|get TICKET [--timeout SECONDS]"
+    if len(argv) < 2 or argv[0] not in ("wait", "get"):
+        die(usage, 2)
+    timeout = 50.0 if argv[0] == "wait" else 0.0
+    if "--timeout" in argv:
+        try:
+            timeout = float(argv[argv.index("--timeout") + 1])
+        except (IndexError, ValueError):
+            die(usage, 2)
+    tid = argv[1]
+    if not TICKET_RE.match(tid):
+        die("not a ticket id (tkt_…)", 2)
+    host, caller = socket.gethostname().split(".")[0], my_caller()
+    end = time.time() + max(0.0, timeout)
+    while True:
+        left = max(0.0, min(end - time.time(), TICKET_WAIT_MAX_S))
+        r = broker_call({"op": "ticket.get", "ticket": tid, "host": host, "caller": caller, "wait": left},
+                        timeout=left + 30)
+        st = r.get("status")
+        if st == "pending" and time.time() < end:
+            continue
+        break
+    if st == "pending":
+        eprint("bws-touchid: %s still pending (owner has not answered yet); run ticket wait again" % tid)
+        sys.exit(75)
+    if st == "approved":
+        res = r.get("result") or {}
+        if r.get("op") == "save":
+            if res.get("ok"):
+                print("ok %s id=%s" % (res.get("action", "saved"), res.get("id", "")))
+                sys.exit(0)
+            die("refused: " + str(res.get("error")), 5)
+        return print_gated(res)
+    if st == "denied":
+        die("refused: " + str(r.get("error")), 5)
+    die(str(r.get("error") or "ticket expired"), 6)
 
 
 # ------------------------------------------------------- local admin
@@ -1323,6 +1733,9 @@ def cmd_status(_argv):
     print("log:       %s" % LOG_PATH)
     a = approvers_of(c)
     print("approvers: %s" % (", ".join(a) if a else "BAD CONFIG %r (every gated op is refused)" % (c.get("approvers"),)))
+    prov, why = provider_of(c)
+    print("provider:  %s" % (prov.name if prov else "REFUSED: %s (every gated op is refused)" % why))
+    print("approval wait: Touch ID %ds, iPhone %ds" % (TOUCHID_WINDOW_S, phone_window(c)))
     ident = iphone_identity(c)
     print("iphone id: %s" % (ident if os.path.exists(ident) else "absent (bws-touchid iphone-setup)"))
     copies = sorted(f[:-len(".iphone.age")] for f in files if f.endswith(".iphone.age"))
@@ -1705,7 +2118,8 @@ def main():
         return cmd_gated(argv)
     cmds = {"init": cmd_init, "store": cmd_store, "status": cmd_status, "delete": cmd_delete,
             "run": cmd_run, "serve": cmd_serve, "reap": cmd_reap, "save": cmd_save, "gated": cmd_gated,
-            "ping": cmd_ping, "tunnel": cmd_tunnel, "approver": cmd_approver, "iphone-setup": cmd_iphone_setup}
+            "ping": cmd_ping, "tunnel": cmd_tunnel, "approver": cmd_approver, "iphone-setup": cmd_iphone_setup,
+            "ticket": cmd_ticket}
     if not argv or argv[0] not in cmds:
         print(__doc__.strip())
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)

@@ -141,12 +141,16 @@ class TestVectors(unittest.TestCase):
         self.assertEqual(set(obj), set(VECTORS["approval"]["request"]))
         self.assertRegex(obj["request_id"], r"^apr_[a-z2-7]{24}$")
         self.assertRegex(obj["nonce"], r"^[A-Za-z0-9_-]{22}$")
-        self.assertEqual(obj["expires_at"], 1791158500)
+        self.assertEqual(obj["expires_at"], 1791158700)   # default approval wait: 300 s
         self.assertIn(b"\\u2026", self.mod.canonical_bytes(obj))
-        c["phone_window_s"] = 5000
-        self.assertEqual(self.mod.phone_window(c), 110)
+        c["phone_window_s"] = 5000                         # legacy key still read, clamped
+        self.assertEqual(self.mod.phone_window(c), 300)
         c["phone_window_s"] = 1
         self.assertEqual(self.mod.phone_window(c), 30)
+        c["approval_wait_s"] = 120                          # the new key wins over the legacy one
+        self.assertEqual(self.mod.phone_window(c), 120)
+        c["approval_wait_s"] = "junk"
+        self.assertEqual(self.mod.phone_window(c), 300)
 
 
 class TestDefaultUnchanged(unittest.TestCase):
@@ -222,7 +226,7 @@ class TestRace(Base):
     def test_phone_approve_wins(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="approve", delay=0.3)
+        self.start_daemon(decision="approve", delay=0.8)
         r = self.handle(READ_REQ)
         self.assertTrue(r["ok"], r)
         # the iPhone copy was decrypted with the iPhone identity and given to bws
@@ -235,7 +239,8 @@ class TestRace(Base):
         req = self.daemon.requests[0]
         canon = json.loads(base64.b64decode(req["canonical_b64"]))
         self.assertEqual(req["expires_at"], canon["expires_at"])
-        self.assertEqual(canon["expires_at"] - canon["created_at"], 100)
+        self.assertEqual(canon["expires_at"] - canon["created_at"], 300)
+        self.assertIsNone(req["prefer_device"])
         self.assertEqual((canon["op"], canon["summary"], canon["project"], canon["token"], canon["broker"]),
                          ("bws", "read all secrets in agents", "agents", "read", "Test Broker"))
         self.assertEqual(self.sb.notified[0][1][-len(" — or approve on iPhone"):], " — or approve on iPhone")
@@ -358,14 +363,18 @@ class TestRace(Base):
         self.assertIn("touchid-unavailable:error", self.last_log())
 
     def test_both_timeout(self):
+        """Touch ID keeps its own (shorter) window; the gate waits for the phone's approval_wait_s + grace."""
+        self.sb.write_config(dict(self.sb.config, approval_wait_s=3))
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "hang"})
         self.start_daemon(decision="silent", delay=60)
         mod = self.sb.module()
-        mod.TOUCHID_WINDOW_S = 2
+        mod.TOUCHID_WINDOW_S, mod.PHONE_WINDOW_MIN, mod.PHONE_GRACE_S = 1, 1, 1
         r = self.handle(READ_REQ, mod)
-        self.assertEqual(r, {"ok": False, "error": "no approval within 2s (Touch ID or iPhone)"})
-        self.assertLess(self.elapsed, 4)
+        self.assertEqual(r, {"ok": False, "error": "no approval within 4s (Touch ID or iPhone)"})
+        self.assertGreater(self.elapsed, 2.9)  # created_at is whole seconds: deadline is 3-4 s away
+        self.assertLess(self.elapsed, 6)
+        self.assertIn("touchid-unavailable:timeout", self.last_log())
         self.assert_touchid_killed()
         self.assertEqual([x["reason"] for x in self.broker_lines()], ["timeout"])
         self.assertIn("result=timeout", self.last_log())

@@ -135,7 +135,9 @@ hosts only `broker_name` and `local_broker` are used.
 | `approvals_socket` | the whispera-link daemon's socket (default `~/.whispera-link/approvals.sock`) |
 | `approvers_dir` | pinned iPhone approve keys, `<device_id>.pub` (default `~/.bws-broker/approvers`) |
 | `iphone_token_identity` | no-biometry identity for the iPhone token copies (default `<conf dir>/identity-iphone.txt`) |
-| `phone_window_s` | how long the phone may answer, clamped 30–110 (default 100) |
+| `approval_wait_s` | how long the iPhone may answer, clamped 30–300 (default 300; the old name `phone_window_s` is still read) |
+| `prefer_device_file` | file holding the last-active device id, forwarded to the daemon as a routing hint (default `~/.whispera-link/last_device`) |
+| `provider` | secret backend behind the approval gate: `bitwarden` (default, the only one shipped). See [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 
 ## iPhone approver (optional)
 
@@ -150,7 +152,8 @@ whichever answers first (whispera-link `docs/PROTOCOL.md` §7, §8, §11):
   `approvers/<device_id>.pub`; a bad signature, unknown device, or expired request is a **deny**.
 - At the same time the Touch ID decrypt runs as before (notification text ends in "— or approve on iPhone").
   Whichever leg answers first wins; the other is cancelled (the Touch ID sheet is killed). A deny from either
-  leg is a deny; no answer within 120 s (`["iphone"]` alone: `phone_window_s` + 5 s) is a deny.
+  leg is a deny. Touch ID keeps its 120 s; the phone may answer for `approval_wait_s` (default 300 s), so the
+  request is denied after 305 s when the phone leg is live, after 120 s when it is not.
 - A phone approval decrypts `tokens/<name>.iphone.age` with a second Secure Enclave identity that has **no
   biometry**; it never falls back to the Touch ID copy.
 - Daemon not running, running as another user, no paired device, no pinned key, no iPhone copy of the
@@ -179,6 +182,31 @@ bws-touchid status                        # approvers, pinned devices, iphone co
 running as you on the Mac can decrypt the `.iphone.age` copies directly, without the broker and without
 either prompt. The phone signature protects the broker path, not those files. Without `iphone-setup` (the
 default) nothing changes: every token copy needs Touch ID.
+
+## Async tickets (callers with a short timeout)
+
+MCP tools are killed after 60 s, shorter than a 5-minute phone approval. Ask asynchronously and collect later:
+
+```bash
+bws-gated --async secret get <id>          # prints {"ticket": "tkt_…"} at once (exit 0)
+printf %s "$V" | bws-save --async KEY      # same; or set BWS_TOUCHID_ASYNC=1 for either
+bws-touchid ticket wait tkt_… [--timeout S] # long-polls (default 50 s); prints what bws-gated / bws-save would
+bws-touchid ticket get tkt_…               # one look, no waiting
+```
+
+`ticket wait|get` exit codes: 0 approved, 5 denied, 6 expired / unknown / already collected / not yours,
+75 still pending (run it again). On the socket: `{"op":"bws"|"save", …, "async":true}` → `{"ok":true,
+"status":"pending","ticket":"tkt_…"}`, and `{"op":"ticket.get","ticket":…,"host":…,"caller":…,"wait":S}` →
+`pending`, `approved` (`result` = the normal response), `denied` (`error`) or `expired`.
+
+Results live in the broker's memory only (never on disk, never logged), are handed out **once**, and are
+dropped 10 minutes after the request finished. A ticket only answers the same uid, host and caller that
+asked (set `BWS_TOUCHID_CALLER` to the same value for both calls); anything else gets `expired`. Approvals
+stay serial: async jobs queue behind each other, and a synchronous request waits up to 30 s for the
+approval slot before it gets "broker busy".
+
+Timeouts nest so a slow approval ends with a broker error, never a client that gave up first: Touch ID
+120 s ≤ iPhone 300 s (+5 s grace) < broker connection 495 s < client 535 s.
 
 ## Threat model and limits
 
@@ -210,7 +238,7 @@ What it does not:
 ## Tests
 
 ```bash
-python3 -m unittest -v      # temp HOME, fake age / age-plugin-se / bws, fake approvals socket; ~40 s
+python3 -m unittest -v      # temp HOME, fake age / age-plugin-se / bws, fake approvals socket; ~2 min
 ```
 
 No Secure Enclave, real token, Touch ID prompt or Bitwarden call is involved. The cross-repo test

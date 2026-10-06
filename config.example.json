@@ -10,5 +10,9 @@
   "notify": true,
   "tunnels": ["other-mac", { "host": "build-box", "remote_sock": "/Users/builder/.bws-broker/fwd.sock" }],
   "_approvers": "[\"touchid\"] = Touch ID only (default). After bws-touchid iphone-setup + approver add: [\"touchid\", \"iphone\"]",
-  "approvers": ["touchid"]
+  "approvers": ["touchid"],
+  "_approval_wait_s": "how long the iPhone may answer (30-300, default 300); Touch ID keeps 120 s",
+  "approval_wait_s": 300,
+  "_provider": "secret backend behind the gate; bitwarden is the only one shipped (docs/PROVIDERS.md)",
+  "provider": "bitwarden"
 }
