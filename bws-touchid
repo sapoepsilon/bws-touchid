@@ -1032,14 +1032,14 @@ class BitwardenProvider(Provider):
             return reject("%d secrets already named %s in %s; fix by hand" % (len(existing), key, project))
         # bws 2.x only takes the value on argv: it is visible to same-user processes on this Mac
         # for the second bws runs. Never logged; redacted from errors.
+        # Values, notes and keys may start with "-" (a PEM is "-----BEGIN ..."), which clap would read as
+        # a flag: option values are attached with "=" and positionals all follow "--".
+        note_arg = ["--note=" + note] if note else []
         if existing:
-            args = ["--output", "json", "secret", "edit", "--value", value]
-            args += ["--note", note] if note else []
-            args.append(existing[0]["id"])
+            args = ["--output", "json", "secret", "edit", "--value=" + value] + note_arg + ["--", existing[0]["id"]]
             action = "updated"
         else:
-            args = ["--output", "json", "secret", "create", key, value, pid]
-            args += ["--note", note] if note else []
+            args = ["--output", "json", "secret", "create"] + note_arg + ["--", key, value, pid]
             action = "created"
         code, out, err = run_bws(args, token, c)
         if code != 0:

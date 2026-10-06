@@ -186,8 +186,34 @@ class TestDefaultUnchanged(unittest.TestCase):
                 sb.cleanup()
         return results
 
+    @staticmethod
+    def bws_semantics(argv):
+        """(options, positionals) the way bws (clap) reads an argv: `--opt V` == `--opt=V`, and
+        positionals are the same whether they follow "--" or not. Since the PEM fix, save passes
+        `--note=N` / `--value=V` and puts every positional after "--"; main passed them bare. Same call,
+        different spelling, so the equivalence check compares meaning (the new spelling is pinned in
+        test_save_argv_spelling)."""
+        opts, pos, i = [], [], 0
+        while i < len(argv):
+            a = argv[i]
+            if a == "--":
+                pos += argv[i + 1:]
+                break
+            if a.startswith("--") and "=" in a:
+                opts.append(tuple(a.split("=", 1)))
+                i += 1
+            elif a in ("--color", "--output", "--note", "--value", "--server-url"):
+                opts.append((a, argv[i + 1]))
+                i += 2
+            else:
+                pos.append(a)
+                i += 1
+        return sorted(opts), pos
+
     def check(self, req, **kw):
         main, branch = self.run_both(req, **kw)
+        for r in (main, branch):
+            r["bws"] = [dict(b, argv=self.bws_semantics(b["argv"])) for b in r["bws"]]
         self.assertEqual(main, branch)
         self.assertEqual(branch["daemon_connections"], 0)
         return branch
@@ -204,6 +230,27 @@ class TestDefaultUnchanged(unittest.TestCase):
     def test_save_ok(self):
         r = self.check(SAVE_REQ)
         self.assertEqual(r["resp"]["action"], "created")
+
+    def test_save_argv_spelling(self):
+        """Pins the dash-safe argv (see bws_semantics) for create and edit."""
+        sb = Sandbox()
+        try:
+            mod = sb.module()
+            pem = "-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----"
+            r = mod.handle(dict(SAVE_REQ, value=pem, note="-n starts with a dash"), os.getpid())
+            self.assertEqual(r.get("action"), "created", r)
+            self.assertEqual(sb.bws_runs()[-1]["argv"],
+                             ["--color", "no", "--output", "json", "secret", "create", "--note=-n starts with a dash",
+                              "--", "UNIT_TEST_KEY", pem, AGENTS_ID])
+            write_text(os.path.join(sb.state, "existing.json"), json.dumps(["UNIT_TEST_KEY"]))
+            r = mod.handle(dict(SAVE_REQ, value=pem, note=""), os.getpid())
+            self.assertEqual(r.get("action"), "updated", r)
+            self.assertEqual(sb.bws_runs()[-1]["argv"],
+                             ["--color", "no", "--output", "json", "secret", "edit", "--value=" + pem,
+                              "--", "44444444-4444-4444-4444-444444444440"])
+            self.assertNotIn("BEGIN PRIVATE", "\n".join(sb.log_lines()))
+        finally:
+            sb.cleanup()
 
     def test_touchid_cancel(self):
         r = self.check(READ_REQ, age={"mode": "cancel"})

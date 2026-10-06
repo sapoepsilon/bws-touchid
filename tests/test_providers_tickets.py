@@ -459,6 +459,28 @@ class TestTicketCli(Base):
         r = self.sb.cli("bws-touchid", "ticket", "wait", tid, "--timeout", "20", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_save_pem_file_on_stdin(self):
+        """Regression: `bws-save KEY < key.p8` - a value starting with dashes must not be read as a flag."""
+        pem = "-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgZmFrZQ==\n-----END PRIVATE KEY-----\n"
+        path = os.path.join(self.sb.root, "AuthKey_FAKE.p8")
+        with open(path, "w") as f:
+            f.write(pem)
+        with open(path) as f:
+            r = subprocess.run(["/usr/bin/python3", os.path.join(self.sb.bin, "bws-save"), "--note", "-- dashes too",
+                                "APNS_TEST_KEY_P8"], stdin=f, env=self.sb.env(), capture_output=True, text=True,
+                               timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ok created APNS_TEST_KEY_P8", r.stdout)
+        argv = self.sb.bws_runs()[-1]["argv"]
+        self.assertEqual(argv[argv.index("--") + 1:], ["APNS_TEST_KEY_P8", pem.rstrip("\n"), AGENTS_ID])
+        self.assertNotIn("BEGIN PRIVATE", "\n".join(self.sb.log_lines()))
+
+    def test_fake_bws_rejects_bare_dash_values_like_real_bws(self):
+        r = subprocess.run([os.path.join(self.sb.bin, "bws"), "--output", "json", "secret", "create", "K",
+                            "-----BEGIN X-----", AGENTS_ID], capture_output=True, text=True, env=self.sb.env())
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unexpected argument '-----BEGIN X-----'", r.stderr)
+
     def test_usage(self):
         self.assertEqual(self.sb.cli("bws-touchid", "ticket").returncode, 2)
         self.assertEqual(self.sb.cli("bws-touchid", "ticket", "wait", "bogus").returncode, 2)
