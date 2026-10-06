@@ -118,7 +118,7 @@ class TestProviders(Base):
         c = self.mod.load_config()
         self.assertEqual(p.parse_read(["secret", "list", AGENTS_ID, "-o", "json"], c),
                          {"kind": "list", "args": ["--output", "json", "secret", "list", AGENTS_ID],
-                          "summary": "read all secrets in agents", "project": "agents"})
+                          "summary": "read all secrets in agents", "project": "agents", "project_id": AGENTS_ID})
         op = p.parse_read(["--server-url", "https://vault.bitwarden.eu", "project", "get", AGENTS_ID], c)
         self.assertEqual((op["kind"], op["project"]), ("get", "agents"))
         self.assertIsNone(p.parse_read(["secret", "create", "K", "v", AGENTS_ID], c))
@@ -247,10 +247,16 @@ class TestPreferDevice(Base):
 
 class TestTickets(Base):
     def dispatch(self, req, uid=UID):
-        return self.mod.dispatch(dict(req), os.getpid(), uid)
+        r = self.mod.dispatch(dict(req), os.getpid(), uid)
+        if r.get("ticket_key"):
+            self.keys = getattr(self, "keys", {})
+            self.keys[r["ticket"]] = r["ticket_key"]
+        return r
 
-    def get(self, tid, wait=0, uid=UID, host="build-box", caller="unit test"):
-        return self.dispatch({"op": "ticket.get", "ticket": tid, "host": host, "caller": caller, "wait": wait}, uid)
+    def get(self, tid, wait=0, uid=UID, host="build-box", caller="unit test", key=None):
+        key = key if key is not None else getattr(self, "keys", {}).get(tid, "")
+        return self.dispatch({"op": "ticket.get", "ticket": tid, "ticket_key": key, "host": host, "caller": caller,
+                              "wait": wait}, uid)
 
     def wait_done(self, tid, **kw):
         end = time.time() + 15
@@ -307,7 +313,8 @@ class TestTickets(Base):
         tid = self.dispatch(dict(GET_REQ, **{"async": True}))["ticket"]
         while self.mod.TICKETS.items[tid]["status"] == "pending":
             time.sleep(0.05)
-        for kw in ({"caller": "someone else"}, {"host": "other-box"}, {"uid": UID + 1}):
+        for kw in ({"caller": "someone else"}, {"host": "other-box"}, {"uid": UID + 1}, {"key": ""},
+                   {"key": "x" * 32}):
             r = self.get(tid, **kw)
             self.assertEqual(r["status"], "expired", kw)
             self.assertNotIn("result", r)

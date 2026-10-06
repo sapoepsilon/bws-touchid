@@ -17,7 +17,8 @@ Commands (also reachable through the bws-save / bws-gated symlinks):
   bws-touchid ping [SOCKET]                           is a broker reachable? (no Touch ID)
   bws-touchid tunnel install|status|uninstall         persistent ssh -R tunnels to the hosts in `tunnels`
   bws-touchid approver add DEVICE_ID PEM | list | remove DEVICE_ID   pin an iPhone approve key
-  bws-touchid iphone-setup                            one-time: no-biometry identity + iPhone token copies
+  bws-touchid iphone-setup --i-understand-same-user-risk   one-time: no-biometry identity + iPhone token copies
+  bws-touchid iphone-teardown [--unpin]               remove the iPhone token copies + identity (and pins)
   bws-touchid ticket wait|get TICKET [--timeout S]    collect the result of an --async request
   bws-save [--async] [--project P] [--note N] [--dry-run] KEY   VALUE on stdin -> broker -> provider save
   bws-gated [--async] <bws args>                      read-only bws through the broker (drop-in BWS_BIN)
@@ -29,6 +30,7 @@ import base64
 import datetime
 import getpass
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -92,18 +94,36 @@ MAX_CONNS = 32                                        # concurrent broker connec
 TICKET_TTL_S = 600              # a finished result is kept this long, then forgotten
 TICKET_WAIT_MAX_S = 55          # longest ticket.get long-poll (fits inside a 60 s MCP call)
 MAX_TICKETS = 64
+MAX_PENDING_PER_CALLER = 8      # one host + caller cannot queue more than this many approvals
 TICKET_RE = re.compile(r"^tkt_[a-z2-7]{24}$")
 OPENSSL = "/usr/bin/openssl"    # absolute path on purpose, never PATH
 SPKI_P256_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
 DEVICE_RE = re.compile(r"^dev_[a-z2-7]{24}$")
+SSH_EXE = "/usr/bin/ssh"        # only this binary counts as an ssh tunnel peer (argv[0] is spoofable)
+# Plaintext of an iPhone token copy: this line, then JSON {"token", "approvers": [sha256 SPKI hex]}. The
+# approver list is sealed together with the token, so a pin file dropped into approvers_dir is not enough
+# for the broker to serve a phone approval: the device must also be bound inside the sealed copy.
+IPHONE_COPY_MAGIC = "bws-touchid-iphone-v2\n"
+RISK_FLAG = "--i-understand-same-user-risk"
+SAME_USER_RISK = (
+    "WARNING: iphone-setup creates a second Secure Enclave identity with NO biometry and encrypts copies of "
+    "your Bitwarden machine tokens to it, so a phone approval can be served without Touch ID. Any process "
+    "running as your user on this Mac (malware, a compromised agent, a rogue npm package) can decrypt those "
+    "tokens/*.iphone.age copies directly, without the broker, the phone or Touch ID, and keep using the "
+    "tokens until you rotate them. The Touch ID copies are not affected. Only continue if you accept that; "
+    "undo it any time with `bws-touchid iphone-teardown`. The planned fix wraps the copies to a key only the "
+    "phone releases after Face ID (WHI-106 option b).")
 
 DEFAULTS = {
     "broker_name": "the broker Mac",          # shown to agents when the broker is unreachable
     "read_token": "read",                     # token used by bws-gated / run
     "write_token": "write",                   # token used by bws-save
     "save_projects": [],                      # project NAMES bws-save may write; first = default
-    "project_names": {},                      # project id -> name, for readable notifications
-    "denied_projects": [],                    # ids or names never read or written
+    "read_tokens": [],                        # token names a read request may pick (default: read_token only)
+    "project_names": {},                      # project id -> name (notifications; a denied name mapped
+                                              # here is denied by that id without a live lookup)
+    "denied_projects": [],                    # ids or names never read or written; unmapped names are
+                                              # resolved to ids with `project list` on every read
     "denied_key_prefixes": [],                # key prefixes never read or written
     "server_urls": ["https://vault.bitwarden.com", "https://vault.bitwarden.eu"],
     "bws_path": "",                           # default: first bws on PATH / common locations
@@ -118,6 +138,7 @@ DEFAULTS = {
     "iphone_token_identity": "",              # default: <conf dir>/identity-iphone.txt (no biometry)
     "approvals_socket": "~/.whispera-link/approvals.sock",   # whispera-link daemon (iphone approver)
     "approvers_dir": "~/.bws-broker/approvers",               # pinned approve keys <device_id>.pub
+    "approvals_peer_paths": [],               # optional: executables allowed to serve approvals_socket
     # "approval_wait_s": 300,                 # how long the phone may answer (clamped 30-300);
     #                                           legacy name "phone_window_s" is still read
     "prefer_device_file": PREFER_DEVICE_FILE, # last-active device id, forwarded as a routing hint
@@ -142,6 +163,12 @@ def clean(s, n=80):
     return s if len(s) <= n else s[:n] + "…"
 
 
+def claimed(s, n):
+    """A client-asserted label (host, caller): printable ASCII only, so look-alike letters, bidi and
+    zero-width characters never reach a prompt, the canonical or the log."""
+    return "".join(ch if " " <= ch < "\x7f" or ch == "…" else "?" for ch in clean(s, n))
+
+
 def load_config():
     c = json.loads(json.dumps(DEFAULTS))
     try:
@@ -159,7 +186,14 @@ def load_config():
     for pid, nm in names.items():  # denying a name also denies its id
         if nm.lower() in c["denied_projects"]:
             c["denied_projects"].append(pid)
+    # Denied NAMES with no id in project_names: bws output only carries projectId, so these are resolved
+    # to ids with a live `project list` before any read result is returned (fail closed).
+    mapped = {v.lower() for v in names.values()}
+    c["denied_unresolved"] = sorted(set(n for n in c["denied_projects"] if not UUID_RE.match(n) and n not in mapped))
     c["save_projects"] = [p for p in c.get("save_projects") or [] if p.lower() not in c["denied_projects"]]
+    rt = c.get("read_tokens")
+    rt = [x for x in rt if isinstance(x, str)] if isinstance(rt, list) else []
+    c["read_tokens"] = list(dict.fromkeys([str(c["read_token"])] + rt))
     return c
 
 
@@ -168,7 +202,9 @@ def denied_project(x, c):
 
 
 def denied_key(k, c):
-    return any(p and str(k).startswith(p) for p in c.get("denied_key_prefixes") or [])
+    """Key prefixes are matched case-insensitively (Bitwarden keys are free-form: Mail_x, mail_x)."""
+    k = str(k or "").upper()
+    return any(p and k.startswith(str(p).upper()) for p in c.get("denied_key_prefixes") or [])
 
 
 def log(fields):
@@ -430,6 +466,111 @@ def pinned_devices(c):
     return [n[:-4] for n in names if n.endswith(".pub") and DEVICE_RE.match(n[:-4])]
 
 
+def private_file_ok(path):
+    """A regular file we own, not a symlink, no group/other bits at all (0600 or tighter)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def exe_path(pid):
+    """The real executable of a process (proc_pidpath), not its self-reported argv[0]. "" if unknown."""
+    try:
+        import ctypes
+        buf = ctypes.create_string_buffer(4096)
+        n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(int(pid), buf, 4096)
+        return buf.value.decode("utf-8", "replace") if n > 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# --- iPhone token copies: the token sealed together with the approve keys allowed to release it
+
+def seal_iphone_payload(token, fps):
+    return IPHONE_COPY_MAGIC + json.dumps({"token": token, "approvers": sorted(set(fps))}, sort_keys=True)
+
+
+def open_iphone_payload(text):
+    """(token, approver fingerprints) of a decrypted iPhone copy. fps None = a pre-binding copy that holds
+    the bare token (re-run `approver add` to bind it); token None = malformed."""
+    if not text.startswith(IPHONE_COPY_MAGIC):
+        return (text.strip() or None), None
+    try:
+        obj = json.loads(text[len(IPHONE_COPY_MAGIC):])
+    except ValueError:
+        return None, None
+    tok = obj.get("token") if isinstance(obj, dict) else None
+    fps = obj.get("approvers") if isinstance(obj, dict) else None
+    if not isinstance(tok, str) or not tok.strip() or not isinstance(fps, list) \
+            or not all(isinstance(x, str) for x in fps):
+        return None, None
+    return tok.strip(), [x.lower() for x in fps]
+
+
+def decrypt_iphone_copy(c, name):
+    """Decrypt tokens/<name>.iphone.age with the no-biometry identity (no prompt).
+    Returns (token, fps, error); fps None = unbound legacy copy."""
+    age = find_tool("age", c.get("age_path"))
+    if not age:
+        return None, None, "age not found (brew install age age-plugin-se)"
+    try:
+        r = subprocess.run([age, "-d", "-i", iphone_identity(c), iphone_token_path(name)],
+                           capture_output=True, timeout=IPHONE_DECRYPT_S, env=tool_env(), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, None, "iPhone token decrypt timed out"
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        return None, None, "iPhone token decrypt failed: %s" % clean(err[-1] if err else "exit %d" % r.returncode, 160)
+    tok, fps = open_iphone_payload(r.stdout.decode("utf-8", "replace"))
+    if not tok:
+        return None, None, "decrypted iPhone token is empty or malformed"
+    return tok, fps, None
+
+
+def iphone_copy_names():
+    try:
+        files = os.listdir(TOKENS_DIR)
+    except OSError:
+        return []
+    return sorted(f[:-len(".iphone.age")] for f in files
+                  if f.endswith(".iphone.age") and NAME_RE.match(f[:-len(".iphone.age")]))
+
+
+def rebind_iphone_copies(c, add=None, keep=None):
+    """Re-seal every iPhone copy with its approver list changed: add one fingerprint and/or keep only
+    `keep`. Decrypts with the no-biometry identity. Returns (names rebound, errors)."""
+    age = find_tool("age", c.get("age_path"))
+    done, errors = [], []
+    if not age or not os.path.exists(RECIPIENT_IPHONE):
+        return done, ["no iPhone identity (bws-touchid iphone-setup)"] if iphone_copy_names() else []
+    for name in iphone_copy_names():
+        tok, fps, err = decrypt_iphone_copy(c, name)
+        if err:
+            errors.append("%s: %s" % (name, err))
+            continue
+        fps = set(fps or [])
+        if keep is not None:
+            fps &= set(keep)
+        if add:
+            fps.add(add)
+        err = encrypt_to(age, RECIPIENT_IPHONE, seal_iphone_payload(tok, fps), iphone_token_path(name))
+        del tok
+        (errors.append("%s: age encrypt failed: %s" % (name, err)) if err else done.append(name))
+    return done, errors
+
+
+def bound_fps(c):
+    """Union of the approver fingerprints sealed in the existing iPhone copies (for new copies)."""
+    out = set()
+    for name in iphone_copy_names():
+        _tok, fps, err = decrypt_iphone_copy(c, name)
+        if not err:
+            out |= set(fps or [])
+    return out
+
+
 # --- the legs
 
 class Leg(object):
@@ -534,6 +675,7 @@ class IphoneLeg(Leg):
         self.rid = canon["request_id"]
         self.sock, self.buf, self.why, self.device = None, b"", "", ""
         self.devices = 0
+        self._tok, self.error = None, ""
 
     def start(self):
         """Connect + request + ack. False (with self.why) = leg unavailable, never a deny."""
@@ -541,6 +683,8 @@ class IphoneLeg(Leg):
             self.why = "no-iphone-identity"
         elif not os.path.isfile(iphone_token_path(self.tname)):
             self.why = "no-iphone-token-copy"
+        elif not private_file_ok(iphone_identity(self.c)) or not private_file_ok(iphone_token_path(self.tname)):
+            self.why = "unsafe-file-mode"   # identity / copy must be ours, not a symlink, 0600
         elif not any(load_pin(self.c, d)[0] for d in pinned_devices(self.c)):
             self.why = "no-pinned-device"
         if self.why:
@@ -563,6 +707,17 @@ class IphoneLeg(Leg):
             self._close()
             self.why = "daemon-uid-mismatch"
             return False
+        allowed = self.c.get("approvals_peer_paths") or []
+        if allowed:  # optional: only these executables may serve the approvals socket
+            try:
+                peer_pid = struct.unpack("i", s.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4))[0]
+            except OSError:
+                peer_pid = -1
+            exe = exe_path(peer_pid) if peer_pid > 0 else ""
+            if not isinstance(allowed, list) or exe not in allowed:
+                self._close()
+                self.why = "daemon-not-allowed(%s)" % clean(os.path.basename(exe) or "?", 40)
+                return False
         try:
             req = {"op": "approval.request", "v": 1, "request_id": self.rid,
                    "canonical_b64": base64.b64encode(self.raw).decode(), "expires_at": self.canon["expires_at"],
@@ -682,28 +837,44 @@ class IphoneLeg(Leg):
         dev = msg.get("device_id") if isinstance(msg.get("device_id"), str) else ""
         self.device = dev if DEVICE_RE.match(dev) else ""
         who = "iphone:" + (self.device or "?")
+        der = load_pin(self.c, self.device)[0] if self.device else None
         if msg["decision"] == "deny":
+            # A deny is unsigned (PROTOCOL v1). Only a pinned approver's deny is final; any other paired or
+            # rogue device only ends the phone leg, and Touch ID keeps waiting (audit M1).
+            if der is None:
+                self._result("unknown_device")
+                return {"kind": "advisory", "approver": who, "why": "deny-from-unpinned-device"}
             self._result("accepted")
             return {"kind": "deny", "approver": who, "why": "phone-deny"}
         outcome = "accepted"
         if msg.get("request_id") != self.rid:
             outcome = "malformed"
-        elif not self.device:
-            outcome = "unknown_device"
+        elif der is None:  # not a pinned approver: it cannot approve, and it must not cancel Touch ID either
+            self._result("unknown_device")
+            return {"kind": "advisory", "approver": who, "why": "unknown_device"}
+        elif now > self.canon["expires_at"]:
+            outcome = "expired"
         else:
-            der, _why = load_pin(self.c, self.device)
-            if der is None:
-                outcome = "unknown_device"
-            elif now > self.canon["expires_at"]:
-                outcome = "expired"
+            sig = msg.get("signature")
+            try:
+                sig_der = base64.b64decode(sig, validate=True) if isinstance(sig, str) else None
+            except ValueError:
+                sig_der = None
+            if not sig_der or not p256_verify(der, b"WL1-APPROVE\n" + self.raw, sig_der):
+                outcome = "bad_signature"
+        if outcome == "accepted":
+            # The signer must also be bound inside the sealed iPhone copy: a pin file alone (plain file,
+            # writable by any same-user process) does not unlock the token (audit H1, broker route).
+            tok, fps, err = decrypt_iphone_copy(self.c, self.tname)
+            if err:
+                self.error = err  # approved, but no token: token() reports it; never the Touch ID copy
+            elif fps is None or fingerprint(der) not in fps:
+                del tok
+                self._result("unknown_device")
+                return {"kind": "advisory", "approver": who,
+                        "why": "unbound_device" if fps is not None else "unbound_device(legacy-copy)"}
             else:
-                sig = msg.get("signature")
-                try:
-                    sig_der = base64.b64decode(sig, validate=True) if isinstance(sig, str) else None
-                except ValueError:
-                    sig_der = None
-                if not sig_der or not p256_verify(der, b"WL1-APPROVE\n" + self.raw, sig_der):
-                    outcome = "bad_signature"
+                self._tok = tok
         self._result(outcome)
         if outcome != "accepted":  # fail closed: something is tampering or confused
             return {"kind": "deny", "approver": who, "why": outcome}
@@ -715,21 +886,10 @@ class IphoneLeg(Leg):
         self._close()
 
     def token(self):
-        """Decrypt the no-biometry iphone copy. Never falls back to the Touch ID copy."""
-        age = find_tool("age", self.c.get("age_path"))
-        if not age:
-            return None, "age not found (brew install age age-plugin-se)"
-        try:
-            r = subprocess.run([age, "-d", "-i", iphone_identity(self.c), iphone_token_path(self.tname)],
-                               capture_output=True, timeout=IPHONE_DECRYPT_S, env=tool_env(),
-                               stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            return None, "iPhone token decrypt timed out"
-        if r.returncode != 0:
-            err = r.stderr.decode("utf-8", "replace").strip().splitlines()
-            return None, "iPhone token decrypt failed: %s" % clean(err[-1] if err else "exit %d" % r.returncode, 160)
-        tok = r.stdout.decode("utf-8").strip()
-        return (tok, None) if tok else (None, "decrypted iPhone token is empty")
+        """The token from the no-biometry iPhone copy, unsealed while checking the binding. Never falls back
+        to the Touch ID copy."""
+        tok, self._tok = self._tok, None
+        return (tok, None) if tok else (None, self.error or "no iPhone token")
 
 
 def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
@@ -798,6 +958,13 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
                 if d["kind"] == "unavailable":
                     notes.append("%s-unavailable:%s" % (leg.name, d["why"]))
                     continue
+                if d["kind"] == "advisory":  # an answer we do not act on; the other leg keeps going
+                    notes.append("%s-ignored:%s" % (leg.name, d["why"]))
+                    if any(x.live for x in legs if x is not leg):
+                        continue
+                    rec["approver"] = d["approver"]
+                    return None, ("denied", "by=%s outcome=%s" % (d["approver"], d["why"]),
+                                  "iPhone answer not accepted (%s) and no other approver" % d["why"])
                 rec["approver"] = d["approver"]
                 other = [x for x in legs if x is not leg]
                 if leg is touch:
@@ -908,21 +1075,29 @@ def validate_read_args(raw, c):
     elif len(pos) == 3 and pos[:2] == ["secret", "list"] and UUID_RE.match(pos[2]):
         summary = "read all secrets in " + name(pos[2])
     elif len(pos) == 3 and pos[:2] == ["secret", "get"] and UUID_RE.match(pos[2]):
-        summary = "read secret %s…" % pos[2][:8]
+        summary = "read secret %s" % pos[2].lower()   # the full id: what the owner approves is unambiguous
     elif len(pos) == 3 and pos[:2] == ["project", "get"] and UUID_RE.match(pos[2]):
         summary = "get project " + name(pos[2])
     else:
         return None
     if any(denied_project(p, c) for p in pos):
         return None
+    if server:
+        summary += " @ " + server.split("://", 1)[-1]
     args = ["--output", "json"] + (["--server-url", server] if server else []) + pos
     return args, summary
 
 
 def scrub(stdout, c):
+    """Drop denied entries by key prefix and by project id AND name. After a live project lookup
+    (c["allowed_project_ids"]), a secret whose projectId is not a visible, allowed project is dropped too."""
+    allowed = c.get("allowed_project_ids")
+
     def bad(e):
-        return (denied_key(e.get("key", ""), c) or denied_project(e.get("projectId"), c)
-                or denied_project(e.get("id"), c) or denied_project(e.get("name"), c))
+        if (denied_key(e.get("key", ""), c) or denied_project(e.get("projectId"), c)
+                or denied_project(e.get("id"), c) or denied_project(e.get("name"), c)):
+            return True
+        return allowed is not None and "key" in e and str(e.get("projectId") or "").lower() not in allowed
     try:
         data = json.loads(stdout or b"null")
     except ValueError:
@@ -963,6 +1138,11 @@ class Provider(object):
     def write_token(self, c):
         return c["write_token"]
 
+    def resolve_projects(self, op, token, c):
+        """Live project ids visible to `token`, minus denied ones (ids and names): (set, None) or (None, why).
+        Used when a denied project name has no id in project_names. A provider without it fails closed."""
+        return None, "provider '%s' cannot resolve denied project names" % self.name
+
     def parse_read(self, raw, c):
         raise NotImplementedError
 
@@ -994,10 +1174,30 @@ class BitwardenProvider(Provider):
             return None
         args, summary = v
         pos = args[4:] if args[2:3] == ["--server-url"] else args[2:]
-        project = c["project_names"].get(pos[2].lower(), pos[2]) \
-            if len(pos) == 3 and pos[:2] in (["secret", "list"], ["project", "get"]) else ""
+        scoped = len(pos) == 3 and pos[:2] in (["secret", "list"], ["project", "get"])
+        project = c["project_names"].get(pos[2].lower(), pos[2]) if scoped else ""
         return {"kind": "list" if "list" in pos[1:2] else "get", "args": args, "summary": summary,
-                "project": project}
+                "project": project, "project_id": pos[2].lower() if scoped else ""}
+
+    def resolve_projects(self, op, token, c):
+        server = op["args"][2:4] if op["args"][2:3] == ["--server-url"] else []
+        code, out, err = run_bws(["--output", "json"] + server + ["project", "list"], token, c)
+        try:
+            projects = json.loads(out) if code == 0 else None
+        except ValueError:
+            projects = None
+        if not isinstance(projects, list) or not all(isinstance(p, dict) for p in projects):
+            return None, "bws project list failed: " + clean(err, 120)
+        allowed = set()
+        for p in projects:
+            pid, name = str(p.get("id") or "").lower(), str(p.get("name") or "").lower()
+            if not UUID_RE.match(pid):
+                return None, "bws project list returned an entry without a project id"
+            if pid in c["denied_projects"] or name in c["denied_projects"]:
+                c["denied_projects"].append(pid)
+            else:
+                allowed.add(pid)
+        return allowed, None
 
     def list(self, op, token, c):
         return run_bws(op["args"], token, c, BWS_TIMEOUT_S)
@@ -1115,16 +1315,21 @@ def prepare(req, peer_pid):
     """Validate a request. Returns a response dict (ping, rejects, dry runs) or a Job for save / bws."""
     c = load_config()
     op = req.get("op", "")
-    host = clean(req.get("host"), 48)
-    caller = clean(req.get("caller"), 60)
+    host = claimed(req.get("host"), 48)
+    caller = claimed(req.get("caller"), 60)
     peer_args = ps_field(peer_pid, "args").split()
-    if peer_args and os.path.basename(peer_args[0]) == "ssh":
-        via = "ssh session to " + clean(ssh_destination(peer_args), 40)
+    named_ssh = bool(peer_args) and os.path.basename(peer_args[0]) == "ssh"
+    # argv[0] is whatever the peer chose; only the real /usr/bin/ssh binary counts as a tunnel (audit L6)
+    if named_ssh and exe_path(peer_pid) == SSH_EXE:
+        via = "ssh session to " + claimed(ssh_destination(peer_args), 40)
         who = "%s (%s)" % (host or "remote", caller or "?")
+        named_ssh = False
     else:
         via = "local: " + clean(proc_chain(ps_field(peer_pid, "ppid") or peer_pid), 70)
         who = caller or "local process"
     rec = {"op": op, "host": host, "caller": caller, "via": via}
+    if named_ssh:
+        rec["notes"] = ["peer-claims-ssh:" + clean(os.path.basename(exe_path(peer_pid)) or "?", 40)]
     dry = bool(req.get("dryrun"))
 
     def reject(msg):
@@ -1191,6 +1396,9 @@ def prepare(req, peer_pid):
         rec["token"] = tname
         if not NAME_RE.match(str(tname)):
             return reject("bad token name")
+        if tname not in c["read_tokens"]:  # a read may not pick the write token on its own (audit M5)
+            return reject("token '%s' is not allowed for reads (config read_tokens: %s)"
+                          % (tname, ", ".join(c["read_tokens"])))
         rop = provider.parse_read(raw, c) \
             if isinstance(raw, list) and all(isinstance(a, str) for a in raw) else None
         if not rop:
@@ -1204,8 +1412,10 @@ def prepare(req, peer_pid):
             log(rec)
             return {"ok": True, "exit": 0, "stdout_b64": base64.b64encode(b"[]").decode()}
 
+        title = "Touch ID: %s" % summary + ("" if tname == c["read_token"] else " (token %s)" % tname)
+
         def run_read(job):
-            token, fail = approve_gate(c, rec, tname, "Touch ID: %s" % summary, "%s [%s]" % (who, via),
+            token, fail = approve_gate(c, rec, tname, title, "%s [%s]" % (who, via),
                                        dict(op="bws", key="", summary=summary, project=rop["project"],
                                             token=tname, host=host, caller=caller, via=via),
                                        prefer)
@@ -1214,6 +1424,18 @@ def prepare(req, peer_pid):
                 log(rec)
                 return {"ok": False, "error": fail[2]}
             job.approved = True
+            if c["denied_unresolved"]:
+                # A denied project NAME without an id in project_names: look the ids up with this token
+                # before reading, and return only secrets of visible, allowed projects (fail closed).
+                allowed, why = provider.resolve_projects(rop, token, c)
+                if allowed is None or (rop.get("project_id") and rop["project_id"] not in allowed):
+                    del token
+                    msg = ("refused: could not resolve denied project names to ids (%s); nothing was read" % why
+                           if allowed is None else "refused: that project is denied or not visible to the token")
+                    rec.update(result="rejected", detail=msg)
+                    log(rec)
+                    return {"ok": False, "error": msg}
+                c["allowed_project_ids"] = allowed
             code, out, err = provider.read(rop, token, c)
             del token
             rec["result"] = "exit=%d" % code
@@ -1244,13 +1466,17 @@ def handle(req, peer_pid):
 # {"ticket"} at once; the job runs in the background, one approval at a time like every other request.
 # ticket.get returns pending | approved (with the result) | denied | expired. Results live in this
 # process's memory only (never on disk, never logged), are handed out once, and are dropped
-# TICKET_TTL_S after the job finished. A ticket only answers the uid + host + caller that created it;
-# anything else - unknown, used, expired, someone else's - gets the same "expired" answer.
+# TICKET_TTL_S after the job finished. A ticket only answers a ticket.get that carries its ticket_key
+# (a random secret returned once, to the creator only; the broker keeps a hash) AND the same uid + host +
+# caller; anything else - unknown, used, expired, someone else's - gets the same "expired" answer.
+# One host + caller may have MAX_PENDING_PER_CALLER tickets pending, and once the owner denies (or lets
+# time out) one of its requests, the ones it queued before that are dropped without another prompt.
 
 class Tickets(object):
     def __init__(self):
         self.lock = threading.Lock()
         self.items = {}
+        self.refused_at = {}    # (uid, host, caller) -> time of the last owner deny / timeout
 
     def _purge(self, now):
         for tid in [t for t, e in self.items.items() if e["done_at"] and now - e["done_at"] > TICKET_TTL_S]:
@@ -1258,15 +1484,35 @@ class Tickets(object):
             e["result"] = None
 
     def create(self, uid, host, caller, op):
+        """(ticket id, ticket key, None) or (None, None, why)."""
         with self.lock:
             self._purge(time.time())
             if len(self.items) >= MAX_TICKETS:
-                return None
+                return None, None, "too many outstanding tickets (%d); collect or let them expire" % MAX_TICKETS
+            mine = [e for e in self.items.values()
+                    if e["status"] == "pending" and (e["uid"], e["host"], e["caller"]) == (uid, host, caller)]
+            if len(mine) >= MAX_PENDING_PER_CALLER:
+                return None, None, "too many pending requests from this host/caller (%d)" % MAX_PENDING_PER_CALLER
             tid = b32id("tkt")
+            key = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
             self.items[tid] = {"uid": uid, "host": host, "caller": caller, "op": op, "status": "pending",
+                               "key_hash": hashlib.sha256(key.encode()).digest(),
                                "created": time.time(), "done_at": None, "result": None,
                                "event": threading.Event()}
-            return tid
+            return tid, key, None
+
+    def note_refused(self, tid):
+        with self.lock:
+            e = self.items.get(tid)
+            if e is not None:
+                self.refused_at[(e["uid"], e["host"], e["caller"])] = time.time()
+
+    def refused_since_created(self, tid):
+        with self.lock:
+            e = self.items.get(tid)
+            if e is None:
+                return False
+            return self.refused_at.get((e["uid"], e["host"], e["caller"]), 0) >= e["created"]
 
     def finish(self, tid, status, result):
         with self.lock:
@@ -1276,15 +1522,17 @@ class Tickets(object):
             e.update(status=status, result=result, done_at=time.time())
             e["event"].set()
 
-    def get(self, tid, uid, host, caller, wait=0):
+    def get(self, tid, key, uid, host, caller, wait=0):
         gone = {"ok": False, "status": "expired",
                 "error": "no such ticket (expired, already collected, or not yours)"}
-        if not isinstance(tid, str) or not TICKET_RE.match(tid):
+        if not isinstance(tid, str) or not TICKET_RE.match(tid) or not isinstance(key, str) or len(key) > 128:
             return gone
+        digest = hashlib.sha256(key.encode()).digest()
         with self.lock:
             self._purge(time.time())
             e = self.items.get(tid)
-            if e is None or (e["uid"], e["host"], e["caller"]) != (uid, host, caller):
+            if e is None or not hmac.compare_digest(e["key_hash"], digest) \
+                    or (e["uid"], e["host"], e["caller"]) != (uid, host, caller):
                 return gone
             ev = e["event"]
         if e["status"] == "pending" and wait > 0:
@@ -1311,7 +1559,12 @@ TICKETS = Tickets()
 def _ticket_worker(job, tid):
     try:
         with GATE_LOCK:
-            resp = job.run()
+            if TICKETS.refused_since_created(tid):  # the owner already said no to this caller: no new prompt
+                resp = job.reject("dropped: the owner denied an earlier request from this host/caller")
+            else:
+                resp = job.run()
+                if job.rec.get("result") in ("denied", "timeout", "auth-failed"):  # Touch ID cancel = auth-failed
+                    TICKETS.note_refused(tid)
     except Exception as e:  # noqa: BLE001
         log({"op": job.op, "result": "error", "detail": "async " + type(e).__name__})
         resp = {"ok": False, "error": "broker error"}
@@ -1319,11 +1572,11 @@ def _ticket_worker(job, tid):
 
 
 def start_async(job, uid):
-    tid = TICKETS.create(uid, job.rec.get("host", ""), job.rec.get("caller", ""), job.op)
+    tid, key, why = TICKETS.create(uid, job.rec.get("host", ""), job.rec.get("caller", ""), job.op)
     if tid is None:
-        return job.reject("too many outstanding tickets (%d); collect or let them expire" % MAX_TICKETS)
+        return job.reject(why)
     threading.Thread(target=_ticket_worker, args=(job, tid), name="ticket", daemon=True).start()
-    return {"ok": True, "status": "pending", "ticket": tid, "ttl_s": TICKET_TTL_S}
+    return {"ok": True, "status": "pending", "ticket": tid, "ticket_key": key, "ttl_s": TICKET_TTL_S}
 
 
 def dispatch(req, peer_pid, peer_uid):
@@ -1334,8 +1587,8 @@ def dispatch(req, peer_pid, peer_uid):
             wait = max(0.0, min(float(req.get("wait") or 0), TICKET_WAIT_MAX_S))
         except (TypeError, ValueError):
             wait = 0.0
-        return TICKETS.get(req.get("ticket"), peer_uid, clean(req.get("host"), 48), clean(req.get("caller"), 60),
-                           wait)
+        return TICKETS.get(req.get("ticket"), req.get("ticket_key"), peer_uid, claimed(req.get("host"), 48),
+                           claimed(req.get("caller"), 60), wait)
     if req.get("async") is True and op in ("save", "bws"):
         job = prepare(req, peer_pid)
         return start_async(job, peer_uid) if isinstance(job, Job) else job
@@ -1535,9 +1788,53 @@ def cmd_save(argv):
     die("refused: " + str(r.get("error")), 5)
 
 
+TICKET_KEY_DIR = os.path.join(SOCK_DIR, "tickets")
+
+
+def ticket_key_path(tid):
+    """Where this host keeps a ticket's key (0600, never argv or stdout); named by a hash of the id."""
+    return os.path.join(TICKET_KEY_DIR, hashlib.sha256(tid.encode()).hexdigest()[:32])
+
+
+def save_ticket_key(tid, key):
+    os.makedirs(SOCK_DIR, mode=0o700, exist_ok=True)
+    write_private(ticket_key_path(tid), key)
+    now = time.time()
+    for f in os.listdir(TICKET_KEY_DIR):  # keys of tickets nobody collected: the broker forgot them long ago
+        path = os.path.join(TICKET_KEY_DIR, f)
+        try:
+            if now - os.lstat(path).st_mtime > 86400:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def load_ticket_key(tid):
+    if os.environ.get("BWS_TOUCHID_TICKET_KEY"):
+        return os.environ["BWS_TOUCHID_TICKET_KEY"]
+    path = ticket_key_path(tid)
+    if not private_file_ok(path):
+        return ""
+    try:
+        with open(path) as f:
+            return f.read(256).strip()
+    except OSError:
+        return ""
+
+
+def drop_ticket_key(tid):
+    try:
+        os.remove(ticket_key_path(tid))
+    except OSError:
+        pass
+
+
 def print_ticket(prog, r):
-    """An --async answer: {"ticket": ...} on stdout (exit 0), or the refusal (exit 5)."""
+    """An --async answer: {"ticket": ...} on stdout (exit 0), or the refusal (exit 5). The ticket key is
+    kept in ~/.bws-broker/tickets/ for `ticket wait|get`; it never goes to stdout or argv."""
     if r.get("ok") and r.get("ticket"):
+        if r.get("ticket_key"):
+            save_ticket_key(r["ticket"], r["ticket_key"])
         print(json.dumps({"ticket": r["ticket"]}))
         eprint("%s: queued for approval; collect with: bws-touchid ticket wait %s" % (prog, r["ticket"]))
         sys.exit(0)
@@ -1590,15 +1887,18 @@ def cmd_ticket(argv):
     if not TICKET_RE.match(tid):
         die("not a ticket id (tkt_…)", 2)
     host, caller = socket.gethostname().split(".")[0], my_caller()
+    key = load_ticket_key(tid)
     end = time.time() + max(0.0, timeout)
     while True:
         left = max(0.0, min(end - time.time(), TICKET_WAIT_MAX_S))
-        r = broker_call({"op": "ticket.get", "ticket": tid, "host": host, "caller": caller, "wait": left},
-                        timeout=left + 30)
+        r = broker_call({"op": "ticket.get", "ticket": tid, "ticket_key": key, "host": host, "caller": caller,
+                         "wait": left}, timeout=left + 30)
         st = r.get("status")
         if st == "pending" and time.time() < end:
             continue
         break
+    if st in ("approved", "denied"):
+        drop_ticket_key(tid)
     if st == "pending":
         eprint("bws-touchid: %s still pending (owner has not answered yet); run ticket wait again" % tid)
         sys.exit(75)
@@ -1688,13 +1988,14 @@ def cmd_store(argv):
     log({"op": "store", "result": "ok", "token": name})
     print("stored token '%s' -> %s (decrypting it needs Touch ID)" % (name, dest))
     if os.path.exists(RECIPIENT_IPHONE):  # already holding the plaintext: no extra prompt
-        err = encrypt_to(age, RECIPIENT_IPHONE, token, iphone_token_path(name))
+        fps = bound_fps(load_config())   # keep the approvers already bound in the other copies
+        err = encrypt_to(age, RECIPIENT_IPHONE, seal_iphone_payload(token, fps), iphone_token_path(name))
         if err:
             del token
             die("iPhone copy: age encrypt failed: " + err)
         log({"op": "store", "result": "ok", "token": name, "detail": "iphone copy"})
-        print("stored iPhone copy -> %s (no biometry; used only after a verified iPhone approval)"
-              % iphone_token_path(name))
+        print("stored iPhone copy -> %s (no biometry; used only after a verified iPhone approval; %d bound approver(s))"
+              % (iphone_token_path(name), len(fps)))
     del token
 
 
@@ -1740,10 +2041,13 @@ def cmd_status(_argv):
     print("iphone id: %s" % (ident if os.path.exists(ident) else "absent (bws-touchid iphone-setup)"))
     copies = sorted(f[:-len(".iphone.age")] for f in files if f.endswith(".iphone.age"))
     print("iphone tokens: %s" % (", ".join(copies) or "none"))
+    bound = bound_fps(c) if copies and os.path.exists(ident) else set()
     pins = pinned_devices(c)
     for d in pins:
         der, why = load_pin(c, d)
-        print("pinned:    %s %s" % (d, display_fp(der) if der else "REFUSED: " + why))
+        tag = "" if not copies else (" (bound)" if der and fingerprint(der) in bound else
+                                     " (NOT bound in the iPhone copies: re-run bws-touchid approver add)")
+        print("pinned:    %s %s%s" % (d, display_fp(der) if der else "REFUSED: " + why, tag))
     if not pins:
         print("pinned:    none (bws-touchid approver add)")
     sock = expand(c.get("approvals_socket") or "")
@@ -1851,8 +2155,12 @@ def cmd_approver(argv):
         path = os.path.join(approvers_dir(c), dev + ".pub")
         if os.path.lexists(path):
             os.remove(path)
-            log({"op": "approver-remove", "result": "ok", "detail": dev})
+            keep = [fingerprint(der) for der in (load_pin(c, d)[0] for d in pinned_devices(c)) if der]
+            done, errors = rebind_iphone_copies(c, keep=keep)  # unbind it from the sealed copies too
+            log({"op": "approver-remove", "result": "ok", "detail": "%s rebound=%s" % (dev, ",".join(done))})
             print("removed %s" % dev)
+            for e in errors:
+                eprint("bws-touchid: could not unbind from the iPhone copy %s" % e)
         else:
             log({"op": "approver-remove", "result": "absent", "detail": dev})
             print("no pin for %s" % dev)
@@ -1885,18 +2193,28 @@ def cmd_approver(argv):
         del token
         path = os.path.join(approvers_dir(c), dev + ".pub")
         write_private(path, pem_from_spki(der))
-        log({"op": "approver-add", "result": "ok", "detail": "%s fp=%s" % (dev, fingerprint(der))})
+        # Bind the key inside every sealed iPhone copy: a pin file alone never unlocks a token.
+        done, errors = rebind_iphone_copies(c, add=fingerprint(der))
+        log({"op": "approver-add", "result": "ok", "detail": "%s fp=%s bound=%s" % (dev, fingerprint(der),
+                                                                                  ",".join(done))})
         print("pinned %s -> %s" % (dev, path))
+        if done:
+            print("bound into the iPhone token copies: %s" % ", ".join(done))
+        for e in errors:
+            eprint("bws-touchid: could not bind into the iPhone copy %s" % e)
         if "iphone" not in (approvers_of(c) or []):
             print('next: set "approvers": ["touchid", "iphone"] in %s and restart the broker' % CONFIG_PATH)
         return
     die("usage: bws-touchid approver add DEVICE_ID PEM | list | remove DEVICE_ID", 2)
 
 
-def cmd_iphone_setup(_argv):
+def cmd_iphone_setup(argv):
     """One-time (owner, two Touch IDs): a no-biometry Secure Enclave identity and an iPhone copy of each
     token, so a phone-signed approval can be served without Touch ID (PROTOCOL.md §11.5)."""
     c = load_config()
+    eprint(SAME_USER_RISK)
+    if RISK_FLAG not in argv:
+        die("not done. Re-run as: bws-touchid iphone-setup %s" % RISK_FLAG, 2)
     if not os.path.exists(IDENTITY):
         die("no Touch ID identity yet: run bws-touchid init and store the tokens first")
     plugin = find_tool("age-plugin-se", c.get("age_plugin_se_path"))
@@ -1905,6 +2223,10 @@ def cmd_iphone_setup(_argv):
         die("age / age-plugin-se not found (brew install age age-plugin-se)")
     ident = iphone_identity(c)
     os.makedirs(os.path.dirname(ident), exist_ok=True)
+    os.makedirs(TOKENS_DIR, exist_ok=True)
+    for d in (CONF_DIR, TOKENS_DIR):
+        os.chmod(d, 0o700)
+    fps = bound_fps(c) if os.path.exists(ident) else set()   # keep approvers already bound
     old = os.umask(0o077)
     try:
         if os.path.exists(ident):
@@ -1930,7 +2252,7 @@ def cmd_iphone_setup(_argv):
         if err:
             log({"op": "iphone-setup", "result": "auth-failed", "token": name})
             die(err)
-        err = encrypt_to(age, RECIPIENT_IPHONE, token, iphone_token_path(name))
+        err = encrypt_to(age, RECIPIENT_IPHONE, seal_iphone_payload(token, fps), iphone_token_path(name))
         del token
         if err:
             die("age encrypt failed: " + err)
@@ -1942,11 +2264,37 @@ iPhone copies: %s
 Next:
   1. whispera-link pair                      (scan the QR with the Whispera app)
   2. bws-touchid approver add <device_id> ~/.whispera-link/keys/<device_id>.approve.pem
+     (binds the phone's key into the copies; a phone that is not bound can never release a token)
   3. set "approvers": ["touchid", "iphone"] in %s
   4. launchctl kickstart -k gui/$(id -u)/bws-touchid.broker
 Threat note: the iPhone identity has no biometry, so a process running as you on this Mac can decrypt
-the .iphone.age copies directly. The phone signature protects the broker path, not those files.""" % (
-        ", ".join(done) or "none", CONFIG_PATH))
+the .iphone.age copies directly. The phone signature protects the broker path, not those files.
+Undo: bws-touchid iphone-teardown""" % (", ".join(done) or "none", CONFIG_PATH))
+
+
+def cmd_iphone_teardown(argv):
+    """Remove the no-biometry identity and every iPhone token copy (and, with --unpin, the pinned keys).
+    Touch ID copies and the Touch ID identity are untouched. No Touch ID needed."""
+    if any(a not in ("--unpin",) for a in argv):
+        die("usage: bws-touchid iphone-teardown [--unpin]", 2)
+    c = load_config()
+    removed = []
+    names = os.listdir(TOKENS_DIR) if os.path.isdir(TOKENS_DIR) else []
+    paths = [os.path.join(TOKENS_DIR, f) for f in sorted(names) if f.endswith((".iphone.age", ".iphone.age.tmp"))]
+    paths += [iphone_identity(c), RECIPIENT_IPHONE]
+    if "--unpin" in argv:
+        paths += [os.path.join(approvers_dir(c), d + ".pub") for d in pinned_devices(c)]
+    for path in paths:
+        if os.path.lexists(path):
+            os.remove(path)
+            removed.append(path)
+            print("removed %s" % path)
+    log({"op": "iphone-teardown", "result": "ok", "detail": "%d files" % len(removed)})
+    if not removed:
+        print("nothing to remove: no iPhone identity or copies")
+    if "iphone" in (approvers_of(c) or []):
+        print('next: set "approvers": ["touchid"] in %s and restart the broker' % CONFIG_PATH)
+    print("If the copies may already have been read, rotate the machine tokens in Bitwarden and re-store them.")
 
 
 # ---------------------------------------------------------------- tunnels
@@ -2119,7 +2467,7 @@ def main():
     cmds = {"init": cmd_init, "store": cmd_store, "status": cmd_status, "delete": cmd_delete,
             "run": cmd_run, "serve": cmd_serve, "reap": cmd_reap, "save": cmd_save, "gated": cmd_gated,
             "ping": cmd_ping, "tunnel": cmd_tunnel, "approver": cmd_approver, "iphone-setup": cmd_iphone_setup,
-            "ticket": cmd_ticket}
+            "iphone-teardown": cmd_iphone_teardown, "ticket": cmd_ticket}
     if not argv or argv[0] not in cmds:
         print(__doc__.strip())
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)

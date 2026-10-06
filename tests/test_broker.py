@@ -15,7 +15,7 @@ import unittest
 
 from tests.fakes.fake_daemon import FakeDaemon, SoftPhone
 from tests.helpers import (AGENTS_ID, FAKE_IPHONE_TOKENS, FAKE_TOKENS, MAIL_ID, REPO, VECTORS, Sandbox,
-                           load_module, pid_alive, write_bytes, write_text)
+                           load_module, open_iphone_payload, pid_alive, write_bytes, write_text)
 
 BOTH = ["touchid", "iphone"]
 READ_REQ = {"op": "bws", "args": ["secret", "list", AGENTS_ID, "-o", "json"], "host": "build-box", "caller": "unit test"}
@@ -345,19 +345,29 @@ class TestRace(Base):
         self.start_daemon(decision="approve")
         self._assert_rejected("bad_signature")
 
-    def test_unknown_device_denies(self):
+    def _assert_ignored(self, outcome, why=None):
+        """An answer from a device that is not a valid, bound approver: refused for the phone leg, but it
+        neither releases a token nor cancels Touch ID (audit M1/H1); Touch ID then wins."""
+        r = self.handle(READ_REQ)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.sb.bws_runs()[-1]["token"], FAKE_TOKENS["read"], "must be the Touch ID copy")
+        self.assertEqual([x.get("outcome") for x in self.broker_lines()], [outcome])
+        self.assertIn("iphone-ignored:" + (why or outcome), self.last_log())
+        self.assertIn("approver=touchid", self.last_log())
+
+    def test_unknown_device_ignored(self):
         self.sb.pin(self.phone)
-        self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="approve_wrong_device")
-        self._assert_rejected("unknown_device")
+        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
+        self.start_daemon(decision="approve_wrong_device", delay=0.2)
+        self._assert_ignored("unknown_device")
 
     def test_group_writable_pin_refused(self):
         self.sb.pin(self.phone, mode=0o620)
         other = SoftPhone(self.sb.root)
         self.sb.pin(other)                      # keeps the leg configured; the signer's pin is unsafe
-        self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="approve")
-        self._assert_rejected("unknown_device")
+        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
+        self.start_daemon(decision="approve", delay=0.2)
+        self._assert_ignored("unknown_device")
 
     def test_symlink_pin_refused(self):
         real = self.sb.pin(self.phone)
@@ -366,9 +376,9 @@ class TestRace(Base):
         os.symlink(moved, real)
         other = SoftPhone(self.sb.root)
         self.sb.pin(other)
-        self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="approve")
-        self._assert_rejected("unknown_device")
+        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
+        self.start_daemon(decision="approve", delay=0.2)
+        self._assert_ignored("unknown_device")
 
     def test_malformed_line_denies(self):
         self.sb.pin(self.phone)
@@ -640,8 +650,19 @@ class TestCli(Base):
     def test_iphone_setup(self):
         for f in ("identity-iphone.txt", "recipient-iphone.txt", "tokens/read.iphone.age", "tokens/write.iphone.age"):
             os.remove(os.path.join(self.sb.conf, f))
-        r = self.sb.cli("bws-touchid", "iphone-setup")
+        r = self.sb.cli("bws-touchid", "iphone-setup")      # without the explicit risk flag: nothing happens
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("WARNING: iphone-setup creates a second Secure Enclave identity with NO biometry", r.stderr)
+        self.assertIn("--i-understand-same-user-risk", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.sb.conf, "identity-iphone.txt")))
+        self.assertEqual(self.sb.age_runs(), [])
+        os.chmod(self.sb.tokens, 0o755)
+        r = self.sb.cli("bws-touchid", "iphone-setup", "--i-understand-same-user-risk")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WARNING", r.stderr)
+        self.assertIn("iphone-teardown", r.stdout)
+        self.assertEqual(os.stat(self.sb.tokens).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(os.path.join(self.sb.conf, "identity-iphone.txt")).st_mode & 0o777, 0o600)
         self.assertIn("approver add", r.stdout)
         self.assertEqual(len(self.sb.age_runs("touchid")), 2, "one Touch ID per token")
         self.assertIn(["keygen", "--access-control", "none", "-o", os.path.join(self.sb.conf, "identity-iphone.txt")],
@@ -652,7 +673,7 @@ class TestCli(Base):
             out = subprocess.run([os.path.join(self.sb.bin, "age"), "-d", "-i",
                                   os.path.join(self.sb.conf, "identity-iphone.txt"), path],
                                  capture_output=True, text=True, env=self.sb.env())
-            self.assertEqual(out.stdout, FAKE_TOKENS[name])
+            self.assertEqual(open_iphone_payload(out.stdout), (FAKE_TOKENS[name], []))   # nothing bound yet
         self.assertFalse([f for f in os.listdir(self.sb.tokens) if f.endswith(".tmp")])
         for run in self.sb.age_runs("encrypt"):
             self.assertNotIn("fake", " ".join(str(v) for v in run.values() if v != run["file"]))

@@ -2,6 +2,8 @@
 
 Nothing here touches the real ~/.config/bws-touchid, ~/.bws-broker, the Secure Enclave or Bitwarden.
 """
+import base64
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -24,6 +26,24 @@ FAKE_TOKENS = {"read": "0.00000000-0000-0000-0000-000000000001.fakeread:ZmFrZQ==
                "write": "0.00000000-0000-0000-0000-000000000002.fakewrite:ZmFrZQ=="}
 # The iPhone copies get a distinguishable value in tests so we can prove which file was decrypted.
 FAKE_IPHONE_TOKENS = {k: v.replace("fake", "fakeiphone") for k, v in FAKE_TOKENS.items()}
+IPHONE_MAGIC = "bws-touchid-iphone-v2\n"   # plaintext header of a sealed iPhone copy (see the script)
+
+
+def pem_fp(pem):
+    """sha256 hex of the SPKI DER inside a public key PEM (the broker's fingerprint())."""
+    body = "".join(l for l in pem.strip().splitlines() if not l.startswith("-----"))
+    return hashlib.sha256(base64.b64decode(body)).hexdigest()
+
+
+def iphone_payload(token, fps):
+    return IPHONE_MAGIC + json.dumps({"token": token, "approvers": sorted(set(fps))}, sort_keys=True)
+
+
+def open_iphone_payload(text):
+    """(token, fps) of a decrypted sealed copy."""
+    assert text.startswith(IPHONE_MAGIC), text[:40]
+    obj = json.loads(text[len(IPHONE_MAGIC):])
+    return obj["token"], obj["approvers"]
 
 _count = [0]
 
@@ -89,12 +109,12 @@ class Sandbox(object):
         self._write(os.path.join(self.conf, "recipient.txt"), touch_id + "\n")
         for name, tok in FAKE_TOKENS.items():
             self._write(os.path.join(self.tokens, name + ".age"), "FAKEAGE\n%s\n%s" % (touch_id, tok))
+        self.bound = set()     # approve-key fingerprints sealed into the iPhone copies
+        self.ph_id = "AGE-PLUGIN-SE-FAKE-none-0002"
         if iphone:
-            ph_id = "AGE-PLUGIN-SE-FAKE-none-0002"
-            self._write(os.path.join(self.conf, "identity-iphone.txt"), ph_id + "\n")
-            self._write(os.path.join(self.conf, "recipient-iphone.txt"), ph_id + "\n")
-            for name, tok in FAKE_IPHONE_TOKENS.items():
-                self._write(os.path.join(self.tokens, name + ".iphone.age"), "FAKEAGE\n%s\n%s" % (ph_id, tok))
+            self._write(os.path.join(self.conf, "identity-iphone.txt"), self.ph_id + "\n")
+            self._write(os.path.join(self.conf, "recipient-iphone.txt"), self.ph_id + "\n")
+            self.write_iphone_copies()
         cfg = {"broker_name": "Test Broker", "save_projects": ["agents"],
                "project_names": {AGENTS_ID: "agents", MAIL_ID: "mail"},
                "denied_projects": ["mail"], "denied_key_prefixes": ["MAIL_"],
@@ -121,11 +141,23 @@ class Sandbox(object):
         self._write(os.path.join(self.state, "age.json"),
                     json.dumps({"touchid": touchid or {"mode": "ok", "delay": 0.1}, "iphone": iphone or {"mode": "ok"}}))
 
-    def pin(self, phone, mode=0o600):
+    def write_iphone_copies(self, legacy=False):
+        """(Re)write tokens/<name>.iphone.age sealing FAKE_IPHONE_TOKENS with self.bound; legacy = the
+        pre-binding format that holds the bare token."""
+        for name, tok in FAKE_IPHONE_TOKENS.items():
+            payload = tok if legacy else iphone_payload(tok, self.bound)
+            self._write(os.path.join(self.tokens, name + ".iphone.age"), "FAKEAGE\n%s\n%s" % (self.ph_id, payload))
+
+    def pin(self, phone, mode=0o600, bind=True):
+        """Pin an approve key the way `approver add` does: pin file + binding in the sealed iPhone copies.
+        bind=False only drops the pin file (what a same-user process can do without the token)."""
         os.makedirs(self.approvers_dir, exist_ok=True)
         os.chmod(self.approvers_dir, 0o700)
         p = os.path.join(self.approvers_dir, phone.device_id + ".pub")
         self._write(p, phone.pem(), mode)
+        if bind and os.path.exists(os.path.join(self.tokens, "read.iphone.age")):
+            self.bound.add(pem_fp(phone.pem()))
+            self.write_iphone_copies()
         return p
 
     def module(self, path=SCRIPT):
