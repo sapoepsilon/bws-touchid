@@ -3,12 +3,21 @@
   "broker_name": "Alice's MacBook",
   "read_token": "read",
   "write_token": "write",
+  "_read_tokens": "token names a read may pick with BWS_TOUCHID_TOKEN; default only read_token",
+  "read_tokens": ["read"],
   "save_projects": ["agents"],
+  "_project_names": "id -> name; a denied name mapped here is denied by that id without a live lookup",
   "project_names": { "00000000-0000-0000-0000-000000000000": "agents" },
+  "_denied_projects": "ids or names; an unmapped name is resolved with project list on every read (fail closed)",
   "denied_projects": ["owner-only"],
+  "_denied_key_prefixes": "matched case-insensitively",
   "denied_key_prefixes": ["OWNER_"],
   "notify": true,
   "tunnels": ["other-mac", { "host": "build-box", "remote_sock": "/Users/builder/.bws-broker/fwd.sock" }],
-  "_approvers": "[\"touchid\"] = Touch ID only (default). After bws-touchid iphone-setup + approver add: [\"touchid\", \"iphone\"]",
-  "approvers": ["touchid"]
+  "_approvers": "[\"touchid\"] = Touch ID only (default). After bws-touchid iphone-setup --i-understand-same-user-risk + approver add: [\"touchid\", \"iphone\"]",
+  "approvers": ["touchid"],
+  "_approval_wait_s": "how long the iPhone may answer (30-300, default 300); Touch ID keeps 120 s",
+  "approval_wait_s": 300,
+  "_provider": "secret backend behind the gate; bitwarden is the only one shipped (docs/PROVIDERS.md)",
+  "provider": "bitwarden"
 }
