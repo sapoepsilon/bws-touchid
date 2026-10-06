@@ -21,10 +21,11 @@ dry runs included, before any prompt.
 | `enabled` | only `True` providers can be selected |
 | `token_env` | how the unsealed token is handed to the backend CLI (e.g. `BWS_ACCESS_TOKEN`) |
 | `read_token(c, requested)` / `write_token(c)` | sealed credential names for reads / saves (default `read_token` / `write_token` from config) |
-| `parse_read(raw, c)` | the client's argv (from `bws-gated`) → `None` (refused) or `{"kind": "list"\|"get", "args", "summary", "project"}`. `summary` is shown in the notification and signed by the phone; `project` must be a readable name. Apply `denied_projects` / `denied_key_prefixes` here |
+| `parse_read(raw, c)` | the client's argv (from `bws-gated`) → `None` (refused) or `{"kind": "list"\|"get", "args", "summary", "project", "project_id"}` (`project_id`: the project uuid a scoped read names, else `""`). `summary` is shown in the notification and signed by the phone; `project` must be a readable name. Apply `denied_projects` / `denied_key_prefixes` here |
 | `list(op, token, c)` / `get(op, token, c)` | run the read; return `(exit_code, stdout_bytes, stderr_text)`. stderr must never contain the token |
 | `save(key, value, note, project, token, c)` | create or update one secret; return `(result, detail, response)` where `result` is the audit word (`created`, `updated`, `rejected`, `error`) and `response` the client JSON. Never log or echo `value` |
-| `scrub(stdout, c)` | drop denied projects / keys from read output |
+| `scrub(stdout, c)` | drop denied projects / keys from read output (keys case-insensitively; when `c["allowed_project_ids"]` is set, also every item whose project is not in it) |
+| `resolve_projects(op, token, c)` | after approval, when a denied project *name* has no id in `project_names`: the project ids visible to `token` minus denied ones, or `(None, why)`. The base class fails closed, so a provider without it refuses such reads |
 
 Rules every provider keeps:
 
