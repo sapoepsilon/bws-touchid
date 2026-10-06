@@ -61,10 +61,13 @@ class Base(unittest.TestCase):
         self.daemon.eof_seen.wait(5)
         return self.daemon.received
 
-    def assert_touchid_killed(self):
-        runs = self.sb.age_runs("touchid")
-        self.assertTrue(runs, "Touch ID leg never started")
-        self.assertFalse(pid_alive(runs[-1]["pid"]), "Touch ID age process still alive")
+    def assert_touchid_killed(self, started=True):
+        """No fake Touch ID process of this sandbox is left. started=True also requires that it ran (only
+        where the test gated the phone's answer on it: a process killed before its interpreter got going
+        never logs)."""
+        if started:
+            self.assertTrue(self.sb.age_runs("touchid"), "Touch ID leg never started")
+        self.assertEqual(self.sb.touchid_procs_alive(), [], "Touch ID age process still alive")
 
 
 class TestVectors(unittest.TestCase):
@@ -273,7 +276,7 @@ class TestRace(Base):
     def test_phone_approve_wins(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="approve", delay=0.8)
+        self.start_daemon(decision="approve", delay=0.8, gate=self.sb.touchid_started)
         r = self.handle(READ_REQ)
         self.assertTrue(r["ok"], r)
         # the iPhone copy was decrypted with the iPhone identity and given to bws
@@ -310,7 +313,7 @@ class TestRace(Base):
     def test_phone_deny(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="deny")
+        self.start_daemon(decision="deny", gate=self.sb.touchid_started)
         r = self.handle(READ_REQ)
         self.assertEqual(r, {"ok": False, "error": "denied on iPhone"})
         self.assertEqual(self.sb.bws_runs(), [])
@@ -334,7 +337,7 @@ class TestRace(Base):
     def test_bad_signature_denies(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="approve_bad")
+        self.start_daemon(decision="approve_bad", gate=self.sb.touchid_started)
         self._assert_rejected("bad_signature")
 
     def test_signature_from_other_key_denies(self):
@@ -342,7 +345,7 @@ class TestRace(Base):
         other.device_id = self.phone.device_id
         self.sb.pin(other)                      # pinned key differs from the signing key
         self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="approve")
+        self.start_daemon(decision="approve", gate=self.sb.touchid_started)
         self._assert_rejected("bad_signature")
 
     def _assert_ignored(self, outcome, why=None):
@@ -357,16 +360,16 @@ class TestRace(Base):
 
     def test_unknown_device_ignored(self):
         self.sb.pin(self.phone)
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
-        self.start_daemon(decision="approve_wrong_device", delay=0.2)
+        self.sb.hold_touchid()
+        self.start_daemon(decision="approve_wrong_device", delay=0.2, after=self.sb.release_touchid)
         self._assert_ignored("unknown_device")
 
     def test_group_writable_pin_refused(self):
         self.sb.pin(self.phone, mode=0o620)
         other = SoftPhone(self.sb.root)
         self.sb.pin(other)                      # keeps the leg configured; the signer's pin is unsafe
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
-        self.start_daemon(decision="approve", delay=0.2)
+        self.sb.hold_touchid()
+        self.start_daemon(decision="approve", delay=0.2, after=self.sb.release_touchid)
         self._assert_ignored("unknown_device")
 
     def test_symlink_pin_refused(self):
@@ -376,14 +379,14 @@ class TestRace(Base):
         os.symlink(moved, real)
         other = SoftPhone(self.sb.root)
         self.sb.pin(other)
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
-        self.start_daemon(decision="approve", delay=0.2)
+        self.sb.hold_touchid()
+        self.start_daemon(decision="approve", delay=0.2, after=self.sb.release_touchid)
         self._assert_ignored("unknown_device")
 
     def test_malformed_line_denies(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "hang"})
-        self.start_daemon(decision="garbage")
+        self.start_daemon(decision="garbage", gate=self.sb.touchid_started)
         self._assert_rejected("malformed")
 
     def test_touchid_wins_while_phone_pending(self):
@@ -413,7 +416,7 @@ class TestRace(Base):
     def test_touchid_error_keeps_waiting_for_phone(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "error", "delay": 0.1})
-        self.start_daemon(decision="approve", delay=0.8)
+        self.start_daemon(decision="approve", delay=0.2, gate=self.sb.touchid_finished)
         r = self.handle(READ_REQ)
         self.assertTrue(r["ok"], r)
         self.assertEqual(self.sb.bws_runs()[-1]["token"], FAKE_IPHONE_TOKENS["read"])
@@ -430,9 +433,9 @@ class TestRace(Base):
         r = self.handle(READ_REQ, mod)
         self.assertEqual(r, {"ok": False, "error": "no approval within 4s (Touch ID or iPhone)"})
         self.assertGreater(self.elapsed, 2.9)  # created_at is whole seconds: deadline is 3-4 s away
-        self.assertLess(self.elapsed, 6)
+        self.assertLess(self.elapsed, 15)    # the bug this guards against is waiting the full 300 s window
         self.assertIn("touchid-unavailable:timeout", self.last_log())
-        self.assert_touchid_killed()
+        self.assert_touchid_killed(started=False)
         self.assertEqual([x["reason"] for x in self.broker_lines()], ["timeout"])
         self.assertIn("result=timeout", self.last_log())
         self.assertIn("approver=none", self.last_log())
@@ -462,7 +465,7 @@ class TestRace(Base):
     def test_phone_approved_but_copy_fails_no_fallback(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "hang"}, iphone={"mode": "error"})
-        self.start_daemon(decision="approve")
+        self.start_daemon(decision="approve", gate=self.sb.touchid_started)
         r = self.handle(READ_REQ)
         self.assertFalse(r["ok"])
         self.assertIn("iPhone token decrypt failed", r["error"])
@@ -478,7 +481,7 @@ class TestFallback(Base):
         self.sb.pin(self.phone)
         r = self.handle(READ_REQ)
         self.assertTrue(r["ok"], r)
-        self.assertLess(self.elapsed, 2)
+        self.assertLess(self.elapsed, 8)   # no hang (Touch ID window 10 s, phone 300 s)
         self.assertEqual(self.sb.bws_runs()[-1]["token"], FAKE_TOKENS["read"])
         self.assertNotIn("or approve on iPhone", self.sb.notified[0][1])
         self.assertIn("iphone-unavailable:daemon-unreachable", self.last_log())
@@ -490,14 +493,14 @@ class TestFallback(Base):
         r = self.handle(READ_REQ)
         self.assertFalse(r["ok"])
         self.assertTrue(r["error"].startswith("Touch ID / decrypt failed: "), r)
-        self.assertLess(self.elapsed, 2)
+        self.assertLess(self.elapsed, 8)   # no hang (Touch ID window 10 s, phone 300 s)
 
     def test_daemon_never_acks(self):
         self.sb.pin(self.phone)
         self.start_daemon(ack="none")
         r = self.handle(READ_REQ)
         self.assertTrue(r["ok"], r)
-        self.assertLess(self.elapsed, 3.5)
+        self.assertLess(self.elapsed, 9)   # the 2 s ack timeout, not a 10 s / 300 s wait
         self.assertIn("iphone-unavailable:no-ack", self.last_log())
 
     def test_daemon_zero_devices(self):
@@ -515,8 +518,8 @@ class TestFallback(Base):
 
     def test_daemon_eof_after_ack(self):
         self.sb.pin(self.phone)
-        self.sb.set_age(touchid={"mode": "ok", "delay": 0.6})
-        self.start_daemon(decision="eof", delay=0.1)
+        self.sb.hold_touchid()                  # Touch ID answers only after the daemon hung up
+        self.start_daemon(decision="eof", delay=0.1, after=self.sb.release_touchid)
         r = self.handle(READ_REQ)
         self.assertTrue(r["ok"], r)
         self.assertIn("iphone-unavailable:daemon-eof", self.last_log())
@@ -540,7 +543,7 @@ class TestFallback(Base):
         self.sb.pin(self.phone)
         r = self.handle(READ_REQ)
         self.assertEqual(r, {"ok": False, "error": "no approver available (Touch ID unavailable, iPhone not connected)"})
-        self.assertLess(self.elapsed, 2)
+        self.assertLess(self.elapsed, 8)   # no hang (Touch ID window 10 s, phone 300 s)
         self.assertIn("result=no-approver", self.last_log())
 
 

@@ -190,7 +190,7 @@ class TestWindow(Base):
         t0 = time.time()
         r = self.mod.handle(dict(READ_REQ), os.getpid())
         self.assertFalse(r["ok"])
-        self.assertLess(time.time() - t0, 2.5)
+        self.assertLess(time.time() - t0, 8)   # not the 300 s phone window
         self.assertEqual(r["error"], "no approval within 1s (Touch ID or iPhone)")
 
     def test_iphone_only_uses_approval_wait(self):
@@ -267,11 +267,19 @@ class TestTickets(Base):
         self.fail("ticket still pending")
 
     def test_async_returns_at_once_then_approved(self):
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.0})
-        t0 = time.time()
-        r = self.dispatch(dict(READ_REQ, **{"async": True}))
-        self.assertLess(time.time() - t0, 0.8, "the ticket must not wait for the approval")
-        self.assertEqual((r["ok"], r["status"]), (True, "pending"))
+        # Hold the approval slot: if dispatch waited for the approval it could not return at all.
+        self.mod.GATE_LOCK.acquire()
+        try:
+            box = []
+            t = threading.Thread(target=lambda: box.append(self.dispatch(dict(READ_REQ, **{"async": True}))))
+            t.start()
+            t.join(30)
+            self.assertTrue(box, "the ticket must not wait for the approval")
+            r = box[0]
+            self.assertEqual((r["ok"], r["status"]), (True, "pending"))
+            self.assertEqual(self.get(r["ticket"]), {"ok": True, "status": "pending", "ticket": r["ticket"]})
+        finally:
+            self.mod.GATE_LOCK.release()
         self.assertRegex(r["ticket"], r"^tkt_[a-z2-7]{24}$")
         tid = r["ticket"]
         self.assertEqual(self.get(tid), {"ok": True, "status": "pending", "ticket": tid})
@@ -352,10 +360,13 @@ class TestTickets(Base):
 
     def test_max_tickets(self):
         self.mod.MAX_TICKETS = 2
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
-        a = self.dispatch(dict(READ_REQ, **{"async": True}))
-        b = self.dispatch(dict(READ_REQ, **{"async": True}))
-        c = self.dispatch(dict(READ_REQ, **{"async": True}))
+        self.mod.GATE_LOCK.acquire()            # none of them can finish while we count
+        try:
+            a = self.dispatch(dict(READ_REQ, **{"async": True}))
+            b = self.dispatch(dict(READ_REQ, **{"async": True}))
+            c = self.dispatch(dict(READ_REQ, **{"async": True}))
+        finally:
+            self.mod.GATE_LOCK.release()
         self.assertTrue(a["ok"] and b["ok"])
         self.assertFalse(c["ok"])
         self.assertIn("too many outstanding tickets", c["error"])
@@ -386,7 +397,7 @@ class TestTickets(Base):
         t0 = time.time()
         r = self.get(tid, wait=20)
         self.assertEqual(r["status"], "approved")
-        self.assertLess(time.time() - t0, 5)
+        self.assertLess(time.time() - t0, 15)   # returned on the decision, not at the 20 s wait
 
     def test_phone_approval_through_ticket(self):
         self.sb.write_config(dict(self.sb.config, approvers=BOTH))
@@ -419,12 +430,10 @@ class TestTicketCli(Base):
         Base.tearDown(self)
 
     def test_gated_async_then_wait(self):
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
+        self.sb.hold_touchid()   # the approval cannot happen before we release it below
         env = {"BWS_TOUCHID_CALLER": "mcp test"}
-        t0 = time.time()
         r = self.sb.cli("bws-gated", "--async", "project", "list", "-o", "json", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertLess(time.time() - t0, 1.4)
         tid = json.loads(r.stdout)["ticket"]
         self.assertIn("bws-touchid ticket wait " + tid, r.stderr)
         # the broker still answers while the approval is pending
@@ -433,6 +442,7 @@ class TestTicketCli(Base):
         self.assertEqual(r.returncode, 75, r.stderr)
         r = self.sb.cli("bws-touchid", "ticket", "wait", tid, env={"BWS_TOUCHID_CALLER": "someone else"})
         self.assertEqual(r.returncode, 6, r.stderr)
+        self.sb.release_touchid()
         r = self.sb.cli("bws-touchid", "ticket", "wait", tid, "--timeout", "20", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout), [{"id": AGENTS_ID, "name": "agents"}])
@@ -456,13 +466,14 @@ class TestTicketCli(Base):
         self.assertIn("refused: Touch ID / decrypt failed", r.stderr)
 
     def test_wait_times_out_pending(self):
-        self.sb.set_age(touchid={"mode": "ok", "delay": 4})
+        self.sb.hold_touchid()
         env = {"BWS_TOUCHID_CALLER": "mcp test"}
         tid = json.loads(self.sb.cli("bws-gated", "--async", "project", "list", env=env).stdout)["ticket"]
         t0 = time.time()
         r = self.sb.cli("bws-touchid", "ticket", "wait", tid, "--timeout", "1", env=env)
         self.assertEqual(r.returncode, 75, r.stderr)
-        self.assertLess(time.time() - t0, 3)
+        self.assertLess(time.time() - t0, 15)   # honoured --timeout 1 instead of the 50 s default
+        self.sb.release_touchid()
         r = self.sb.cli("bws-touchid", "ticket", "wait", tid, "--timeout", "20", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
 

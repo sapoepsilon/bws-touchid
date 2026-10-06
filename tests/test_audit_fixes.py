@@ -184,6 +184,7 @@ class TestPinFileDropRoute(Base):
         self.assertFalse(r["ok"], r)
         self.assertIn("iPhone answer not accepted (unbound_device)", r["error"])
         self.assertEqual(self.sb.bws_runs(), [], "bws must not run with the iPhone copy")
+        self.daemon.eof_seen.wait(5)
         self.assertEqual([x["outcome"] for x in self.daemon.received], ["unknown_device"])
         self.assertIn("iphone-ignored:unbound_device", self.last_log())
 
@@ -270,11 +271,12 @@ class TestAdvisoryAnswers(Base):
     def test_unsigned_deny_from_unpinned_device_does_not_cancel_touchid(self):
         self.sb.pin(self.phone)                          # the real phone (keeps the leg configured)
         rogue = SoftPhone(self.sb.root)                  # paired with the daemon, never pinned
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
-        self.daemon_with(rogue, decision="deny", delay=0.1)
+        self.sb.hold_touchid()                           # Touch ID answers only after the deny was handled
+        self.daemon_with(rogue, decision="deny", delay=0.1, after=self.sb.release_touchid)
         r = self.handle(READ)
         self.assertTrue(r["ok"], r)
         self.assertEqual(self.sb.bws_runs()[-1]["token"], FAKE_TOKENS["read"])
+        self.daemon.eof_seen.wait(5)
         self.assertEqual([x["outcome"] for x in self.daemon.received], ["unknown_device"])
         self.assertIn("iphone-ignored:deny-from-unpinned-device", self.last_log())
         self.assertIn("approver=touchid", self.last_log())
@@ -363,17 +365,24 @@ class TestTicketKey(Base):
 class TestTicketSpam(Base):
     def test_per_caller_pending_cap(self):
         self.mod.MAX_PENDING_PER_CALLER = 2
-        self.sb.set_age(touchid={"mode": "ok", "delay": 1.0})
-        a = self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID)
-        b = self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID)
-        c = self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID)
-        other = self.mod.dispatch(dict(READ, caller="agent-B", **{"async": True}), os.getpid(), UID)
+        self.mod.GATE_LOCK.acquire()                     # nothing gets approved while we count
+        try:
+            a = self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID)
+            b = self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID)
+            c = self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID)
+            other = self.mod.dispatch(dict(READ, caller="agent-B", **{"async": True}), os.getpid(), UID)
+        finally:
+            self.mod.GATE_LOCK.release()
         self.assertTrue(a["ok"] and b["ok"] and other["ok"])
         self.assertEqual(c, {"ok": False, "error": "too many pending requests from this host/caller (2)"})
 
     def test_queue_dropped_after_owner_deny(self):
         self.sb.set_age(touchid={"mode": "cancel", "delay": 0.5})
-        tickets = [self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID) for _ in range(4)]
+        self.mod.GATE_LOCK.acquire()                     # all four are queued before the first prompt
+        try:
+            tickets = [self.mod.dispatch(dict(READ, **{"async": True}), os.getpid(), UID) for _ in range(4)]
+        finally:
+            self.mod.GATE_LOCK.release()
         out = []
         for t in tickets:
             r = self.mod.dispatch({"op": "ticket.get", "ticket": t["ticket"], "ticket_key": t["ticket_key"],

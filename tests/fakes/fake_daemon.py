@@ -48,11 +48,15 @@ class FakeDaemon(threading.Thread):
     decision: "approve" | "approve_bad" (signs other bytes) | "approve_wrong_device" | "deny" | "silent"
               | "eof" | "garbage"
     delay:    seconds between ack and decision
+    gate:     optional callable; the decision is sent only once it returns true (max 30 s), so a test
+              can order the phone's answer after an event (e.g. the Touch ID prompt really started)
+    after:    optional callable run once a connection is over (decision answered, EOF sent, ...)
     """
 
-    def __init__(self, path, phone, ack="ok", decision="approve", delay=0.6):
+    def __init__(self, path, phone, ack="ok", decision="approve", delay=0.6, gate=None, after=None):
         super(FakeDaemon, self).__init__(daemon=True)
         self.path, self.phone, self.ack, self.decision, self.delay = path, phone, ack, decision, delay
+        self.gate, self.after = gate, after
         self.connections = 0
         self.requests = []      # parsed approval.request objects
         self.received = []      # every later line from the broker (approval.result / approval.cancel)
@@ -86,6 +90,8 @@ class FakeDaemon(threading.Thread):
                 self._serve(conn)
             finally:
                 conn.close()
+                if self.after:  # after the broker got our answer (or our EOF)
+                    self.after()
 
     def _lines(self, conn, buf, until, until_eof=False):
         """Read lines until the first line(s) arrive (or, with until_eof, until EOF), `until` (monotonic)
@@ -134,6 +140,10 @@ class FakeDaemon(threading.Thread):
                           "push": "unconfigured"})
         more, buf, eof = self._lines(conn, buf, time.monotonic() + self.delay)
         self.received += more
+        end = time.monotonic() + 30
+        while self.gate and not (eof or more) and not self.gate() and time.monotonic() < end:
+            more, buf, eof = self._lines(conn, buf, time.monotonic() + 0.05)
+            self.received += more
         if eof or more:  # the broker cancelled or went away before we decided
             if not eof:
                 more, buf, eof = self._lines(conn, buf, time.monotonic() + 5, True)

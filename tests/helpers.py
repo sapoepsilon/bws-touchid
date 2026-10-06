@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -147,6 +148,37 @@ class Sandbox(object):
         for name, tok in FAKE_IPHONE_TOKENS.items():
             payload = tok if legacy else iphone_payload(tok, self.bound)
             self._write(os.path.join(self.tokens, name + ".iphone.age"), "FAKEAGE\n%s\n%s" % (self.ph_id, payload))
+
+    # --- ordering helpers: make the Touch ID / phone race deterministic instead of timing it
+    def touchid_started(self):
+        """The fake Touch ID age process is running (it logged itself)."""
+        return bool(self.age_runs("touchid"))
+
+    def touchid_finished(self, settle=1.0):
+        """The fake Touch ID process exited at least `settle` s ago, so the broker (which polls its legs
+        every 0.1 s) has seen the result before the phone answers."""
+        runs = self.age_runs("touchid")
+        if not runs or pid_alive(runs[-1]["pid"]):
+            return False
+        self._finished_at = getattr(self, "_finished_at", None) or time.time()
+        return time.time() - self._finished_at >= settle
+
+    @property
+    def touchid_go(self):
+        return os.path.join(self.state, "touchid.go")
+
+    def hold_touchid(self, mode="ok"):
+        """Fake Touch ID that answers `mode` only after release_touchid()."""
+        self.set_age(touchid={"mode": mode, "until": self.touchid_go})
+
+    def release_touchid(self):
+        open(self.touchid_go, "w").close()
+
+    def touchid_procs_alive(self):
+        """pids of this sandbox's fake age processes that are still running (not zombies)."""
+        r = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,stat=,command="], capture_output=True, text=True)
+        me = os.path.join(self.bin, "age") + " "
+        return [l.split()[0] for l in r.stdout.splitlines() if me in l and not l.split()[1].startswith("Z")]
 
     def pin(self, phone, mode=0o600, bind=True):
         """Pin an approve key the way `approver add` does: pin file + binding in the sealed iPhone copies.

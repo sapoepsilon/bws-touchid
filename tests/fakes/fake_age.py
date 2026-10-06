@@ -3,7 +3,8 @@
 
 Copied into <sandbox>/bin/age; state lives in <sandbox>/state. Decrypt behaviour per leg (identity file
 basename identity.txt = "touchid", anything else = "iphone") comes from state/age.json:
-  {"touchid": {"mode": "ok|cancel|error|hang", "delay": 0.2}, "iphone": {...}}
+  {"touchid": {"mode": "ok|cancel|error|hang", "delay": 0.2, "until": "/path"}, "iphone": {...}}
+"until": do not answer before that file exists (the test releases the "sensor" when it is ready).
 Every run appends {"pid", "leg", "identity", "file", "mode"} to state/age.log.
 """
 import json
@@ -31,6 +32,9 @@ def main():
         with open(os.path.join(STATE, "age.log"), "a") as f:
             f.write(json.dumps({"pid": os.getpid(), "leg": leg, "identity": ident, "file": path, "mode": mode}) + "\n")
         time.sleep(float(ctl.get("delay", 0)))
+        end = time.time() + 60
+        while ctl.get("until") and not os.path.exists(ctl["until"]) and time.time() < end:
+            time.sleep(0.02)
         if mode == "hang":
             time.sleep(3600)
         if mode == "cancel":
