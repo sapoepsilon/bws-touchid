@@ -520,8 +520,10 @@ class TestReviewFixes(Base):
         self.assertLess(self.elapsed, 3.5, "the verify timeout waited twice")
         self.assertGreaterEqual(self.elapsed, 1.9)
         self.assertIn("passcode-unavailable:error", r["error"])
-        self.assertIn("op=passcode result=abandoned token=read detail=failures=1/5 via=dialog reason=timeout",
-                      "\n".join(self.sb.log_lines()))
+        self.assertIn("passcode-error:1", r["error"])
+        log = "\n".join(self.sb.log_lines())
+        self.assertIn("op=passcode result=error token=read detail=failures=1/5 via=dialog", log)   # as documented
+        self.assertNotIn("result=abandoned", log)
         self.assertEqual(self.sb.pc_state()["failures"], 1)
 
     def test_tool_error_counts_but_ends_the_leg(self):
@@ -595,6 +597,93 @@ class TestReviewFixes(Base):
         mod.passcode_state = lambda: answers.pop(0) if answers else None
         mod.PASSCODE_BACKOFF_S = 60
         self.assertRegex(mod.passcode_summary(), r"set \(read, write\), 1/5 failed, next try in \d+s")
+
+
+class TestRound2Gate(Base):
+    """Security review round 2: the verify near the deadline, kill/finish races, OSErrors."""
+
+    def short(self):
+        mod = self.module()
+        mod.TOUCHID_WINDOW_S = 3   # created_at is whole seconds: the real window is 2-3 s
+        mod.PASSCODE_WINDOW_S = 3
+        return mod
+
+    def test_passcode_typed_at_the_deadline_is_verified(self):
+        # item 1: the dialog answers at ~1.2 s of a 2-3 s window, the verify takes 2.5 s more
+        self.sb.write_config(dict(self.sb.config, approvers=["passcode"]))
+        self.sb.set_dialog([PASSCODE], delay=1.0)
+        self.sb.set_age(passcode={"mode": "ok", "delay": 2.5})
+        r = self.handle(READ_REQ, self.short())
+        self.assertTrue(r["ok"], r)
+        self.assertGreater(self.elapsed, 3.2, "the verify did not outlive the deadline")
+        self.assertIn("approver=passcode", self.last_log())
+        self.assertEqual(self.sb.pc_state()["failures"], 0)
+        self.assertNotIn("result=abandoned", "\n".join(self.sb.log_lines()))
+
+    def test_late_verify_with_touchid_held_still_approves(self):
+        self.sb.hold_touchid()
+        self.sb.set_dialog([PASSCODE], delay=1.0)
+        self.sb.set_age(touchid={"mode": "ok", "until": self.sb.touchid_go}, passcode={"mode": "ok", "delay": 2.5})
+        r = self.handle(READ_REQ, self.short())
+        self.assertTrue(r["ok"], r)
+        self.assertIn("approver=passcode", self.last_log())
+        self.assertEqual(self.sb.touchid_procs_alive(), [], "Touch ID left running past the deadline")
+
+    def test_late_wrong_passcode_times_out_and_counts(self):
+        self.sb.write_config(dict(self.sb.config, approvers=["passcode"]))
+        self.sb.set_dialog([WRONG % 1, PASSCODE], delay=1.0)
+        self.sb.set_age(passcode={"mode": "ok", "delay": 2.5})
+        r = self.handle(READ_REQ, self.short())
+        self.assertFalse(r["ok"])
+        self.assertIn("no approval within", r["error"])
+        self.assertEqual(len(self.sb.dialog_runs()), 1, "re-prompted past the deadline")
+        self.assertEqual(self.sb.pc_state()["failures"], 1)
+        self.assertRegex("\n".join(self.sb.log_lines()), r"op=passcode result=wrong token=read detail=failures=1/5")
+
+    def verify_leg(self, mod, script):
+        """A PasscodeLeg in its verify phase, its 'age' a shell script; attempt 2 already counted."""
+        self.sb.write_pc_state(failures=2, last_failure=1)
+        notes = []
+        leg = mod.PasscodeLeg(mod.load_config(), "read", time.time() + 10, "p", notes)
+        leg.live, leg.phase, leg.failures, leg.verify_by = True, "verify", 2, time.time() + 10
+        leg.proc = subprocess.Popen(["/bin/sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True)
+        return leg, notes
+
+    def payload_script(self, mod, sleep):
+        payload = mod.seal_passcode_payload(FAKE_PASSCODE_TOKENS["read"], "read")
+        return "sleep %s; printf '%%s' '%s'" % (sleep, payload.replace("'", "'\\''"))
+
+    def test_cancel_racing_a_finished_verify_settles_success(self):
+        # item 3: the verify exits 0 while kill_group is sending its signal
+        mod = self.module()
+        leg, notes = self.verify_leg(mod, self.payload_script(mod, 0.3))
+        real_kill = mod.kill_group
+        mod.kill_group = lambda proc: (proc.wait(5), real_kill(proc))
+        leg.cancel("touchid_approved")
+        self.assertEqual(self.sb.pc_state()["failures"], 0, "a right passcode resets the counter")
+        self.assertNotIn("result=abandoned", "\n".join(self.sb.log_lines()))
+        self.assertEqual(leg.token(), (None, "no passcode token"), "the token is discarded")
+        self.assertFalse(leg.live)
+
+    def test_cancel_kills_a_running_verify_as_abandoned(self):
+        mod = self.module()
+        leg, notes = self.verify_leg(mod, "sleep 30")
+        leg.cancel("touchid_approved")
+        self.assertEqual(self.sb.pc_state()["failures"], 2)
+        self.assertIn("passcode-abandoned:2", notes)
+        self.assertIsNotNone(leg.proc.returncode)
+
+    def test_verify_timeout_racing_a_finish_uses_the_result(self):
+        mod = self.module()
+        leg, notes = self.verify_leg(mod, self.payload_script(mod, 0.3))
+        leg.verify_by = 0
+        real_kill = mod.kill_group
+        mod.kill_group = lambda proc: (proc.wait(5), real_kill(proc))
+        d = leg.poll(time.time())
+        self.assertEqual(d, {"kind": "approve", "approver": "passcode", "why": ""})
+        self.assertEqual(leg.token()[0], FAKE_PASSCODE_TOKENS["read"])
+        self.assertEqual(self.sb.pc_state()["failures"], 0)
 
 
 class TestCliReviewFixes(Base):

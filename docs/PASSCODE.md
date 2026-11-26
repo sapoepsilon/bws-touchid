@@ -72,7 +72,10 @@ missing, the passcode is locked, or the backoff is longer than the window.
 - Every attempt is counted **before** the decrypt runs, so killing the verify does not save a try; a right
   passcode resets the count. If Touch ID or the phone answers while a verify is still running, the verify is
   killed at once and the attempt stays counted (`op=passcode result=abandoned … reason=<why>`); a lockout
-  reached that way is notified like any other.
+  reached that way is notified like any other. A verify that exits on its own just as it is killed is
+  settled by its real outcome instead (a right passcode still resets the count; its token is discarded).
+- A passcode submitted before the 120 s deadline is always verified: the request waits for that verify
+  (at most 30 s) instead of killing it at the deadline, so a late answer is not wasted as `abandoned`.
 - A tool error (plugin crash, out of memory, missing plugin, a decrypt that takes over 30 s) is counted too,
   but it ends the passcode leg (`passcode-unavailable:error`, log `result=error`) instead of re-prompting
   "Wrong passcode".

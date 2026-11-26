@@ -1311,10 +1311,16 @@ class PasscodeLeg(Leg):
             self._show(now)
             return None
         if self.proc.poll() is None:
-            if self.phase == "verify" and now >= self.verify_by:   # a stuck age: a tool error, not a guess
-                self.cancel("timeout")
+            if self.phase == "verify":   # bounded by verify_by, not the deadline: a passcode typed late still counts
+                if now < self.verify_by:
+                    return None
+                kill_group(self.proc)    # a stuck age: a tool error, not a guess
+                if self.proc.returncode is not None and self.proc.returncode >= 0:
+                    return self._verified(now)   # it finished as we stopped it: its real outcome
                 self.error = "passcode decrypt timed out"
-                return {"kind": "unavailable", "approver": "passcode", "why": "error"}
+                passcode_failed(self.c, self.tname, self.failures, "error", "dialog")
+                self.notes.append("passcode-error:%s" % self.failures)
+                return self._end("unavailable", "error")
             if now >= self.deadline:
                 self.cancel("timeout")
                 return {"kind": "unavailable", "approver": "passcode", "why": "timeout"}
@@ -1395,11 +1401,12 @@ class PasscodeLeg(Leg):
 
     def cancel(self, reason):
         """Stop at once (the caller holds GATE_LOCK). A verify still running is killed: its attempt was
-        counted before it started, so it stays counted and is logged as abandoned. One that already
-        finished but was not read yet is settled by its real outcome."""
+        counted before it started, so it stays counted and is logged as abandoned. One that finished
+        before it could be killed (not read yet, or exiting as the signal arrived) is settled by its real
+        outcome; its token is discarded."""
         if self.live and self.phase == "verify" and self.proc is not None:
-            if self.proc.poll() is None:
-                kill_group(self.proc)
+            kill_group(self.proc)
+            if self.proc.returncode is None or self.proc.returncode < 0:   # killed (or unkillable)
                 locked = self.failures >= PASSCODE_MAX_FAILURES
                 log({"op": "passcode", "result": "abandoned", "token": self.tname,
                      "detail": "failures=%s/%d via=dialog reason=%s%s" % (
@@ -1479,12 +1486,19 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
         elif pc:
             notify(title, msg + " — enter passcode" + (" or approve on iPhone" if phone else ""), c)
         legs = [x for x in (phone, pc, touch) if x is not None]
+
+        def verifying():   # a passcode typed just before the deadline: its verify (bounded by verify_by) may finish
+            return pc is not None and pc.live and pc.phase == "verify"
         while True:
             now = time.time()
             if now >= deadline:
+                if not verifying():
+                    for leg in legs:
+                        leg.cancel("timeout")
+                    return None, ("timeout", "", "no approval within %ds (%s)" % (window, who))
                 for leg in legs:
-                    leg.cancel("timeout")
-                return None, ("timeout", "", "no approval within %ds (%s)" % (window, who))
+                    if leg is not pc and leg.live:
+                        leg.cancel("timeout")
             live = [x for x in legs if x.live]
             if not live:
                 if touch is not None and touch.error and phone is None and "passcode" not in approvers:
@@ -1499,7 +1513,7 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
             else:
                 time.sleep(0.1)
             now = time.time()
-            if now >= deadline:
+            if now >= deadline and not verifying():
                 continue
             for leg in live:
                 d = leg.poll(now)
