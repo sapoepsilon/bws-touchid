@@ -28,6 +28,20 @@ FAKE_TOKENS = {"read": "0.00000000-0000-0000-0000-000000000001.fakeread:ZmFrZQ==
 # The iPhone copies get a distinguishable value in tests so we can prove which file was decrypted.
 FAKE_IPHONE_TOKENS = {k: v.replace("fake", "fakeiphone") for k, v in FAKE_TOKENS.items()}
 IPHONE_MAGIC = "bws-touchid-iphone-v2\n"   # plaintext header of a sealed iPhone copy (see the script)
+# Passcode copies get their own distinguishable value too, and a passcode no fake ever echoes.
+FAKE_PASSCODE_TOKENS = {k: v.replace("fake", "fakepasscode") for k, v in FAKE_TOKENS.items()}
+PASSCODE = "Corr3ct-H0rse-Zq9"
+PASSCODE_MAGIC = "bws-touchid-passcode-v1\n"
+
+
+def passcode_file(passcode, payload):
+    """A tokens/<name>.passcode.age the way tests/fakes/fake_age.py `-j batchpass` writes one."""
+    salt = os.urandom(8).hex()
+    return "FAKEAGE-SCRYPT\n%s\n%s\n%s" % (salt, hashlib.sha256(salt.encode() + passcode.encode()).hexdigest(), payload)
+
+
+def passcode_payload(token, name):
+    return PASSCODE_MAGIC + json.dumps({"token": token, "name": name}, sort_keys=True)
 
 
 def pem_fp(pem):
@@ -93,7 +107,8 @@ class Sandbox(object):
         self.state = os.path.join(self.root, "state")
         for d in (self.home, self.bin, self.state):
             os.makedirs(d)
-        for src, dst in (("fake_age.py", "age"), ("fake_bws.py", "bws"), ("fake_age_plugin_se.py", "age-plugin-se")):
+        for src, dst in (("fake_age.py", "age"), ("fake_bws.py", "bws"), ("fake_age_plugin_se.py", "age-plugin-se"),
+                         ("fake_age_plugin_batchpass.py", "age-plugin-batchpass"), ("fake_osascript.py", "osascript")):
             p = os.path.join(self.bin, dst)
             shutil.copy(os.path.join(FAKES, src), p)
             os.chmod(p, 0o755)
@@ -121,6 +136,8 @@ class Sandbox(object):
                "denied_projects": ["mail"], "denied_key_prefixes": ["MAIL_"],
                "age_path": os.path.join(self.bin, "age"), "bws_path": os.path.join(self.bin, "bws"),
                "age_plugin_se_path": os.path.join(self.bin, "age-plugin-se"),
+               "age_plugin_batchpass_path": os.path.join(self.bin, "age-plugin-batchpass"),
+               "osascript_path": os.path.join(self.bin, "osascript"),
                "notify": False, "approvals_socket": self.sock}
         if approvers is not None:
             cfg["approvers"] = approvers
@@ -138,9 +155,10 @@ class Sandbox(object):
         self.config = cfg
         self._write(os.path.join(self.conf, "config.json"), json.dumps(cfg))
 
-    def set_age(self, touchid=None, iphone=None):
+    def set_age(self, touchid=None, iphone=None, passcode=None):
         self._write(os.path.join(self.state, "age.json"),
-                    json.dumps({"touchid": touchid or {"mode": "ok", "delay": 0.1}, "iphone": iphone or {"mode": "ok"}}))
+                    json.dumps({"touchid": touchid or {"mode": "ok", "delay": 0.1}, "iphone": iphone or {"mode": "ok"},
+                                "passcode": passcode or {"mode": "ok"}}))
 
     def write_iphone_copies(self, legacy=False):
         """(Re)write tokens/<name>.iphone.age sealing FAKE_IPHONE_TOKENS with self.bound; legacy = the
@@ -201,6 +219,36 @@ class Sandbox(object):
     def jsonl(self, name):
         p = os.path.join(self.state, name)
         return [json.loads(x) for x in read_text(p).splitlines()] if os.path.exists(p) else []
+
+    # --- passcode approver
+    @property
+    def pc_state_path(self):
+        return os.path.join(self.conf, "passcode-state.json")
+
+    def write_passcode_copies(self, passcode=PASSCODE, tokens=None, failures=0, last_failure=0, locked=False):
+        """What `passcode set` leaves behind: one sealed copy per token + a fresh 0600 counter."""
+        for name, tok in (tokens or FAKE_PASSCODE_TOKENS).items():
+            self._write(os.path.join(self.tokens, name + ".passcode.age"),
+                        passcode_file(passcode, passcode_payload(tok, name)))
+        self.write_pc_state(failures, last_failure, locked)
+
+    def write_pc_state(self, failures=0, last_failure=0, locked=False):
+        self._write(self.pc_state_path, json.dumps({"v": 1, "failures": failures, "last_failure": last_failure,
+                                                    "locked": locked}))
+
+    def pc_state(self):
+        return json.loads(read_text(self.pc_state_path))
+
+    def set_dialog(self, answers=(), mode="ok", delay=0):
+        self._write(os.path.join(self.state, "osascript.json"),
+                    json.dumps({"answers": list(answers), "mode": mode, "delay": delay}))
+        try:
+            os.remove(os.path.join(self.state, "osascript.n"))
+        except OSError:
+            pass
+
+    def dialog_runs(self):
+        return self.jsonl("osascript.log")
 
     def age_runs(self, leg=None):
         return [r for r in self.jsonl("age.log") if leg is None or r["leg"] == leg]
