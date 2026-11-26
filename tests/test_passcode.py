@@ -763,6 +763,18 @@ class TestRound2Gate(Base):
         self.assertEqual(self.sb.bws_runs(), [])
         self.assertEqual(self.procs_alive("osascript"), [])
 
+    def test_empty_answer_at_the_deadline_does_not_reopen(self):
+        # final review 3: an empty answer read at/after the deadline ends the leg instead of a new dialog
+        mod = self.module()
+        leg = mod.PasscodeLeg(mod.load_config(), "read", time.time() - 1, "p", [])
+        leg.live, leg.phase = True, "prompt"
+        leg.proc = subprocess.Popen(["/bin/sh", "-c", "printf 'P\\n'"], stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, start_new_session=True)
+        leg.proc.wait()
+        self.assertEqual(leg.poll(time.time()), {"kind": "unavailable", "approver": "passcode", "why": "timeout"})
+        self.assertFalse(leg.live)
+        self.assertEqual(self.sb.dialog_runs(), [])
+
     def test_touchid_cancel_without_a_passcode_leg_denies(self):
         os.remove(os.path.join(self.sb.tokens, "read.passcode.age"))   # passcode leg skipped
         self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})

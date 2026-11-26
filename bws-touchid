@@ -1415,7 +1415,9 @@ class PasscodeLeg(Leg):
                 return self._end("unavailable", "gave-up")
             if not n or buf[0] != ord("P") or n == len(buf):
                 return self._end("unavailable", "dialog-error")
-            if n == 1:                    # empty answer: no attempt, ask again
+            if n == 1:                    # empty answer: no attempt, ask again while there is time
+                if now >= self.deadline:
+                    return self._end("unavailable", "timeout")
                 return self._show(now)
             failures, why = passcode_begin_attempt(now)
             if why:
