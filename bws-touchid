@@ -125,6 +125,7 @@ PASSCODE_STATE = os.path.join(CONF_DIR, "passcode-state.json")
 PASSCODE_LOCK_S = 2.0           # give up on the counter's flock after this (the caller holds GATE_LOCK)
 PASSCODE_SEAL_LOCK_S = 30.0     # store vs passcode set / change: wait this long for tokens/.passcode-seal.lock
 OSASCRIPT = "/usr/bin/osascript"
+PASSCODE_DIALOG_PID = os.path.join(CONF_DIR, "passcode-dialog.pid")   # the open dialog, for the next broker
 SAME_USER_RISK = (
     "WARNING: iphone-setup creates a second Secure Enclave identity with NO biometry and encrypts copies of "
     "your Bitwarden machine tokens to it, so a phone approval can be served without Touch ID. Any process "
@@ -1275,6 +1276,7 @@ class PasscodeLeg(Leg):
         self.c, self.tname, self.deadline, self.prompt, self.notes = c, tname, deadline, prompt, notes
         self.proc, self.phase, self.why, self.error = None, "", "", ""
         self.next_at, self.failures, self.verify_by, self._tok = 0.0, 0, 0.0, None
+        self.dialog_pid = None
         self.dialog = expand(c.get("osascript_path")) or OSASCRIPT
 
     def start(self, now=None):
@@ -1317,11 +1319,35 @@ class PasscodeLeg(Leg):
             self.error = "passcode dialog failed: %s" % clean(e, 120)
             return self._end("unavailable", "error")
         self.phase = "prompt"
+        self._remember_dialog()
         return None
+
+    def _remember_dialog(self):
+        """Record the dialog (its own session) so a broker restarted after a SIGKILL can close it."""
+        self.dialog_pid = self.proc.pid
+        info = {"broker": os.getpid(), "pid": self.proc.pid, "lstart": ps_field(self.proc.pid, "lstart")}
+        tmp = PASSCODE_DIALOG_PID + ".tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(info))
+            os.replace(tmp, PASSCODE_DIALOG_PID)
+        except OSError:
+            pass   # best effort: the dialog still gives up on its own at the deadline
+
+    def _forget_dialog(self):
+        if self.dialog_pid is None:
+            return
+        self.dialog_pid = None
+        try:
+            os.remove(PASSCODE_DIALOG_PID)
+        except OSError:
+            pass
 
     def _end(self, kind, why):
         self.live = False
         self._reap()
+        self._forget_dialog()
         return {"kind": kind, "approver": "passcode", "why": why}
 
     def _reap(self):
@@ -1366,6 +1392,7 @@ class PasscodeLeg(Leg):
         return self._answered(now) if self.phase == "prompt" else self._verified(now)
 
     def _answered(self, now):
+        self._forget_dialog()   # the dialog has exited
         buf = bytearray(PASSCODE_MAX_LEN * 4 + 8)
         n = 0
         try:
@@ -1472,11 +1499,54 @@ class PasscodeLeg(Leg):
                 del tok
         kill_group(self.proc)
         self._reap()
+        self._forget_dialog()
         self.live = False
 
     def token(self):
         tok, self._tok = self._tok, None
         return (tok, None) if tok else (None, self.error or "no passcode token")
+
+
+def sweep_stale_dialog(c):
+    """At broker start: close a passcode dialog left open by a broker that was SIGKILLed (the dialog runs
+    in its own session, so it outlives the broker until it gives up at its deadline). Only the process
+    named in PASSCODE_DIALOG_PID is touched, and only if its broker is gone and it is still that dialog:
+    same uid, same start time, our dialog program in its argv with the passcode dialog title."""
+    path = PASSCODE_DIALOG_PID
+    if not os.path.lexists(path):
+        return
+    try:
+        info = None
+        if private_file_ok(path):
+            with open(path) as f:
+                info = json.loads(f.read(4096))
+        broker, pid, lstart = info["broker"], info["pid"], info["lstart"]
+        if not (isinstance(broker, int) and isinstance(pid, int) and pid > 1 and isinstance(lstart, str) and lstart):
+            raise ValueError
+    except (OSError, ValueError, TypeError, KeyError):
+        broker = pid = None
+    if broker is not None and broker != os.getpid():
+        try:
+            os.kill(broker, 0)
+            return   # that broker is still running: the dialog is its own
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return
+    if pid is not None:
+        dialog = expand(c.get("osascript_path")) or OSASCRIPT
+        args = ps_field(pid, "args")
+        if (" %s " % dialog) in (" %s " % args) and " bws-touchid passcode " in args + " " and \
+                ps_field(pid, "uid") == str(os.getuid()) and ps_field(pid, "lstart") == lstart:
+            try:
+                os.killpg(pid, signal.SIGTERM)   # its own session: pgid == pid
+                log({"op": "passcode", "result": "swept", "detail": "closed a stale dialog pid=%d" % pid})
+            except OSError:
+                pass
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
@@ -2259,6 +2329,7 @@ def serve_conn(conn, slots):
 
 def cmd_serve(_argv):
     os.umask(0o077)
+    sweep_stale_dialog(load_config())
     os.makedirs(SOCK_DIR, exist_ok=True)
     os.chmod(SOCK_DIR, 0o700)
     try:

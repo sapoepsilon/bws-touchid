@@ -113,6 +113,13 @@ missing, the passcode is locked, or the backoff is longer than the window.
   **After a suspected passcode leak, rotate the Bitwarden machine-account access tokens** (new token in the
   Bitwarden web app, `bws-touchid store NAME`, revoke the old one, then `passcode change`); changing the
   passcode alone does not help against a copy someone already has.
+- **Orphaned dialog after a broker crash.** The dialog runs in its own session, so if the broker is
+  SIGKILLed (or crashes hard) while it is open, the dialog stays on screen until it gives up at its deadline
+  (at most 120 s). An answer typed into it then goes nowhere: nobody reads osascript's stdout, nothing is
+  decrypted or counted. The broker records the open dialog in `~/.config/bws-touchid/passcode-dialog.pid`
+  (0600: its own pid, the dialog's pid and start time) and on its next start closes that dialog, but only if
+  the recording broker is gone and the process is still that dialog (same uid and start time, our dialog
+  program and title in its argv); log `op=passcode result=swept`.
 - **Phishing.** Anything running as you can draw a look-alike dialog and ask for the passcode; Touch ID cannot
   be phished that way. Only type it when the notification just before the dialog names a request you expect.
 - **Plaintext copies in memory.** getpass, UTF-8 decoding and osascript produce Python `str` / process copies

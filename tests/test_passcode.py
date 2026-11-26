@@ -716,6 +716,96 @@ class TestRound2Gate(Base):
         self.assertIn("op=passcode result=error token=read detail=failures=1/5 via=dialog",
                       "\n".join(self.sb.log_lines()))
 
+
+class TestStaleDialog(Base):
+    """Item 7: a dialog orphaned by a SIGKILLed broker is closed by the next broker, and nothing else is."""
+
+    def pidfile(self):
+        return os.path.join(self.sb.conf, "passcode-dialog.pid")
+
+    def dead_pid(self):
+        p = subprocess.Popen(["/usr/bin/true"])
+        p.wait()
+        return p.pid
+
+    def spawn(self, argv):
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        time.sleep(0.3)
+        return p
+
+    def orphan_dialog(self):
+        self.sb.set_dialog(mode="hang")
+        return self.spawn([os.path.join(self.sb.bin, "osascript"), "-e", "on run argv", "request text",
+                           "bws-touchid passcode", "118"])
+
+    def write_pidfile(self, broker, pid, lstart=None):
+        mod = self.mod or self.module()
+        self.mod = mod
+        self.sb._write(self.pidfile(), json.dumps({"broker": broker, "pid": pid,
+                                                   "lstart": lstart if lstart is not None else
+                                                   mod.ps_field(pid, "lstart")}))
+
+    def gone(self, p, wait=5):
+        try:
+            p.wait(wait)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    def test_gate_records_and_forgets_the_dialog(self):
+        mod = self.mod = self.module()
+        self.sb.set_dialog(mode="hang")
+        leg = mod.PasscodeLeg(mod.load_config(), "read", time.time() + 10, "p", [])
+        self.assertTrue(leg.start())
+        self.assertIsNone(leg.poll(time.time()))
+        info = json.loads(read_text(self.pidfile()))
+        self.assertEqual((info["broker"], info["pid"]), (os.getpid(), leg.proc.pid))
+        self.assertEqual(os.stat(self.pidfile()).st_mode & 0o777, 0o600)
+        leg.cancel("touchid_approved")
+        self.assertFalse(os.path.exists(self.pidfile()))
+        r = self.handle(READ_REQ)          # through the gate: Touch ID wins, dialog closed, file gone
+        self.assertTrue(r["ok"], r)
+        self.assertFalse(os.path.exists(self.pidfile()))
+
+    def test_sweep_closes_an_orphaned_dialog(self):
+        p = self.orphan_dialog()
+        self.write_pidfile(self.dead_pid(), p.pid)
+        self.mod.sweep_stale_dialog(self.mod.load_config())
+        self.assertTrue(self.gone(p), "orphaned dialog left open")
+        self.assertFalse(os.path.exists(self.pidfile()))
+        self.assertIn("op=passcode result=swept", "\n".join(self.sb.log_lines()))
+
+    def test_sweep_leaves_other_processes_alone(self):
+        p = self.spawn(["/bin/sleep", "30"])          # pid reused by something else
+        self.write_pidfile(self.dead_pid(), p.pid)
+        self.mod.sweep_stale_dialog(self.mod.load_config())
+        self.assertFalse(self.gone(p, 0.5))
+        self.assertFalse(os.path.exists(self.pidfile()))
+
+    def test_sweep_checks_the_start_time(self):
+        p = self.orphan_dialog()
+        self.write_pidfile(self.dead_pid(), p.pid, lstart="Thu Jan  1 00:00:00 1970")
+        self.mod.sweep_stale_dialog(self.mod.load_config())
+        self.assertFalse(self.gone(p, 0.5))
+
+    def test_sweep_spares_a_live_brokers_dialog(self):
+        p = self.orphan_dialog()
+        other = self.spawn(["/bin/sleep", "30"])      # "another broker" still running
+        self.write_pidfile(other.pid, p.pid)
+        self.mod.sweep_stale_dialog(self.mod.load_config())
+        self.assertFalse(self.gone(p, 0.5))
+        self.assertTrue(os.path.exists(self.pidfile()))
+
+    def test_sweep_ignores_an_unsafe_pidfile(self):
+        p = self.orphan_dialog()
+        self.write_pidfile(self.dead_pid(), p.pid)
+        os.chmod(self.pidfile(), 0o644)
+        self.mod.sweep_stale_dialog(self.mod.load_config())
+        self.assertFalse(self.gone(p, 0.5))
+        self.assertFalse(os.path.exists(self.pidfile()))
+
 class TestCliReviewFixes(Base):
     def setUp(self):
         Base.setUp(self)
