@@ -979,6 +979,31 @@ class TestCliReviewFixes(Base):
         self.assertEqual(self.decrypt_copy("write", PASSCODE).returncode, 0)
         self.assertEqual(self.tmp_copies(), [])
 
+    def test_remove_waits_for_a_running_set(self):
+        # final review 4: `passcode remove` takes the seal lock, so it cannot delete a running set's
+        # .tmp copies under it; it runs after the renames and removes the finished copies
+        self.sb.set_age(passcode_encrypt={"delay": 1.0})
+        res = {}
+
+        def run_set():
+            res["set"] = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE])
+        t = threading.Thread(target=run_set)
+        t.start()
+        end = time.time() + 30
+        while not self.tmp_copies() and time.time() < end:
+            time.sleep(0.02)
+        self.assertTrue(self.tmp_copies(), "set never started sealing")
+        busy = self.lock_busy()
+        r = self.sb.cli("bws-touchid", "passcode", "remove")
+        t.join(60)
+        code, out = res["set"]
+        self.assertTrue(busy, "set did not hold the seal lock while sealing")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("removed %s" % os.path.join(self.sb.tokens, "read.passcode.age"), r.stdout)
+        self.assertNotIn(".tmp", r.stdout, "remove ran while set was sealing")
+        self.assertFalse([f for f in os.listdir(self.sb.tokens) if ".passcode." in f])
+
     def test_seal_lock_gives_up_when_busy(self):
         mod = self.module()
         mod.PASSCODE_SEAL_LOCK_S = 0.2

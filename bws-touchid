@@ -3211,6 +3211,14 @@ def exclude_from_backups(c, paths):
 
 
 def passcode_remove(c):
+    lock = take_seal_lock("passcode remove")   # never delete a running set / change's copies under it
+    try:
+        _passcode_remove(c)
+    finally:
+        os.close(lock)
+
+
+def _passcode_remove(c):
     removed = []
     names = sorted(os.listdir(TOKENS_DIR)) if os.path.isdir(TOKENS_DIR) else []
     for path in [os.path.join(TOKENS_DIR, f) for f in names if f.endswith((".passcode.age", ".passcode.age.tmp"))] \
