@@ -1599,6 +1599,8 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
             notify(title, msg + " — enter passcode" + (" or approve on iPhone" if phone else ""), c)
         legs = [x for x in (phone, pc, touch) if x is not None]
 
+        touch_cancelled = False
+
         def verifying():   # a passcode typed just before the deadline: its verify (bounded by verify_by) may finish
             return pc is not None and pc.live and pc.phase == "verify"
         while True:
@@ -1613,6 +1615,9 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
                         leg.cancel("timeout")
             live = [x for x in legs if x.live]
             if not live:
+                if touch_cancelled:   # the only explicit answer was cancelling the Touch ID sheet
+                    rec["approver"] = "touchid"
+                    return None, ("denied", "by=touchid", touch.error)
                 if touch is not None and touch.error and phone is None and "passcode" not in approvers:
                     return None, ("auth-failed", touch.error, touch.error)  # today's error
                 if "passcode" not in approvers:
@@ -1641,8 +1646,14 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
                     rec["approver"] = d["approver"]
                     return None, ("denied", "by=%s outcome=%s" % (d["approver"], d["why"]),
                                   "iPhone answer not accepted (%s) and no other approver" % d["why"])
-                rec["approver"] = d["approver"]
                 other = [x for x in legs if x is not leg]
+                if leg is touch and d["kind"] == "deny" and d["why"] == "cancel" and any(x.live for x in other):
+                    # Cancelling the sheet only drops Touch ID while the passcode dialog or the phone is still
+                    # up, so either can be used instead; their own Deny is still final.
+                    touch_cancelled = True
+                    notes.append("touchid-cancelled")
+                    continue
+                rec["approver"] = d["approver"]
                 if leg is touch:
                     reason = "touchid_approved" if d["kind"] == "approve" else "touchid_denied"
                     for x in other:

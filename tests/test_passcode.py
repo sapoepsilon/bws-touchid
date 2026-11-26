@@ -717,6 +717,43 @@ class TestRound2Gate(Base):
                       "\n".join(self.sb.log_lines()))
 
 
+    def test_touchid_cancel_keeps_the_passcode_dialog(self):
+        # item 8: at the Mac, cancel the Touch ID sheet and type the passcode instead
+        self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})
+        self.sb.set_dialog([PASSCODE], delay=1.5)
+        r = self.handle(READ_REQ)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.sb.bws_runs()[-1]["token"], FAKE_PASSCODE_TOKENS["read"])
+        self.assertIn("approver=passcode", self.last_log())
+        self.assertIn("touchid-cancelled", self.last_log())
+
+    def test_touchid_cancel_then_dialog_deny_denies(self):
+        self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})
+        self.sb.set_dialog(mode="cancel", delay=1.5)
+        r = self.handle(READ_REQ)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "denied in the passcode dialog")
+        self.assertIn("by=passcode", self.last_log())
+        self.assertEqual(self.sb.bws_runs(), [])
+
+    def test_touchid_cancel_then_dialog_gives_up_is_a_touchid_deny(self):
+        self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})
+        self.sb.set_dialog(["unused"], mode="gaveup", delay=1.5)
+        r = self.handle(READ_REQ)
+        self.assertFalse(r["ok"])
+        self.assertIn("Touch ID / decrypt failed", r["error"])
+        self.assertIn("by=touchid", self.last_log())
+        self.assertIn("passcode-unavailable:gave-up", self.last_log())
+
+    def test_touchid_cancel_without_a_passcode_leg_denies(self):
+        os.remove(os.path.join(self.sb.tokens, "read.passcode.age"))   # passcode leg skipped
+        self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})
+        r = self.handle(READ_REQ)
+        self.assertFalse(r["ok"])
+        self.assertIn("Touch ID / decrypt failed", r["error"])
+        self.assertIn("by=touchid", self.last_log())
+        self.assertEqual(self.sb.dialog_runs(), [])
+
 class TestStaleDialog(Base):
     """Item 7: a dialog orphaned by a SIGKILLed broker is closed by the next broker, and nothing else is."""
 

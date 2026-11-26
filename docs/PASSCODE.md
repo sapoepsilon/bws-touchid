@@ -59,7 +59,12 @@ set/change is running"). An interrupted `set` / `change` (Ctrl-C, a crash, an er
   request, for up to 120 s. The request text goes to AppleScript through `on run argv`; the answer comes back
   on osascript's stdout pipe, is read into a `bytearray`, written into the age pipe and zeroed. The first
   answer wins: a right passcode approves (Touch ID sheet and phone request are cancelled), **Deny** is a deny,
-  Touch ID or the phone answering first closes the dialog. A wrong passcode re-opens the dialog ("Wrong
+  Touch ID or the phone answering first closes the dialog. **Cancelling the Touch ID sheet is not a deny while
+  the passcode dialog (or the phone request) is still up**: it only drops Touch ID, so you can cancel the sheet
+  and type the passcode instead (log note `touchid-cancelled`). To refuse, press Deny in the dialog or on the
+  phone; if nothing else answers, the request ends as denied by Touch ID once the dialog gives up, or times
+  out while the phone may still answer. With Touch ID the only live approver, cancelling it is a deny as
+  before. A wrong passcode re-opens the dialog ("Wrong
   passcode (n of 5 attempts used)") after the backoff. The notification ends in "— or enter passcode".
   Log lines: `approver=passcode`, notes `passcode-wrong:<n>`, `passcode-unavailable:<why>`.
 - **`bws-touchid run --passcode -- CMD`** (local, interactive, e.g. in an ssh session to the broker Mac):

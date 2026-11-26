@@ -168,8 +168,10 @@ whichever answers first (whispera-link `docs/PROTOCOL.md` §7, §8, §11):
   cancel Touch ID. A deny from a pinned approver is final. With `["iphone"]` alone an ignored answer is a
   deny (fail closed).
 - At the same time the Touch ID decrypt runs as before (notification text ends in "— or approve on iPhone").
-  Whichever leg answers first wins; the other is cancelled (the Touch ID sheet is killed). A deny from Touch
-  ID or from a pinned approver is a deny. Touch ID keeps its 120 s; the phone may answer for `approval_wait_s` (default 300 s), so the
+  Whichever leg answers first wins; the other is cancelled (the Touch ID sheet is killed). A deny from a
+  pinned approver is a deny. Cancelling the Touch ID sheet while the phone request (or the passcode dialog)
+  is still live only ends the Touch ID leg, so the other approver can still be used; with Touch ID the only
+  live approver it is a deny as before. Touch ID keeps its 120 s; the phone may answer for `approval_wait_s` (default 300 s), so the
   request is denied after 305 s when the phone leg is live, after 120 s when it is not.
 - A phone approval decrypts `tokens/<name>.iphone.age` with a second Secure Enclave identity that has **no
   biometry**; it never falls back to the Touch ID copy.
