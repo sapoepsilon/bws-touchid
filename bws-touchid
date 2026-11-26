@@ -11,7 +11,7 @@ Commands (also reachable through the bws-save / bws-gated symlinks):
   bws-touchid store NAME [--stdin]                    encrypt a token (hidden prompt; no Touch ID needed)
   bws-touchid status                                  identity, stored token names, broker reachability
   bws-touchid delete NAME                             remove an encrypted token
-  bws-touchid run [--token NAME] -- CMD...            Touch ID, then exec CMD with BWS_ACCESS_TOKEN set
+  bws-touchid run [--token NAME] [--passcode] -- CMD...  Touch ID (or the passcode), then exec CMD with BWS_ACCESS_TOKEN
   bws-touchid serve                                   the broker (launchd, gui/<uid>)
   bws-touchid reap                                    delete a dead forwarded socket (remote hosts)
   bws-touchid ping [SOCKET]                           is a broker reachable? (no Touch ID)
@@ -19,6 +19,7 @@ Commands (also reachable through the bws-save / bws-gated symlinks):
   bws-touchid approver add DEVICE_ID PEM | list | remove DEVICE_ID   pin an iPhone approve key
   bws-touchid iphone-setup --i-understand-same-user-risk   one-time: no-biometry identity + iPhone token copies
   bws-touchid iphone-teardown [--unpin]               remove the iPhone token copies + identity (and pins)
+  bws-touchid passcode set|change|remove|status|unlock  optional passcode approver (set/change/unlock need Touch ID)
   bws-touchid ticket wait|get TICKET [--timeout S]    collect the result of an --async request
   bws-save [--async] [--project P] [--note N] [--dry-run] KEY   VALUE on stdin -> broker -> provider save
   bws-gated [--async] <bws args>                      read-only bws through the broker (drop-in BWS_BIN)
@@ -30,6 +31,7 @@ import base64
 import datetime
 import getpass
 import hashlib
+import fcntl
 import hmac
 import json
 import os
@@ -69,7 +71,7 @@ SOL_LOCAL, LOCAL_PEERCRED, LOCAL_PEERPID = 0, 0x001, 0x002
 EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local", "bin")]
 
 # Approvers (whispera-link protocol v1, PROTOCOL.md §7, §8, §11). Module constants so tests can shrink them.
-KNOWN_APPROVERS = ("touchid", "iphone")
+KNOWN_APPROVERS = ("touchid", "iphone", "passcode")
 TOUCHID_WINDOW_S = 120          # Touch ID leg deadline (today's decrypt timeout)
 APPROVAL_WAIT_DEFAULT_S = 300   # how long the iPhone leg may take (approval_wait_s)
 PHONE_WINDOW_MIN, PHONE_WINDOW_MAX = 30, 300
@@ -105,6 +107,22 @@ SSH_EXE = "/usr/bin/ssh"        # only this binary counts as an ssh tunnel peer 
 # for the broker to serve a phone approval: the device must also be bound inside the sealed copy.
 IPHONE_COPY_MAGIC = "bws-touchid-iphone-v2\n"
 RISK_FLAG = "--i-understand-same-user-risk"
+
+# Passcode approver (opt-in). Each token has a passcode copy tokens/<name>.passcode.age: age's own scrypt
+# passphrase recipient (age-plugin-batchpass, passphrase on an inherited pipe fd, never argv/env), so only
+# the right passcode decrypts it; there is no hash compare in front of plaintext. Attempts are counted in
+# PASSCODE_STATE (0600): exponential backoff, hard lockout after PASSCODE_MAX_FAILURES that only Touch ID
+# (`passcode unlock` / `passcode change`) clears. Module constants so tests can shrink them.
+PASSCODE_COPY_MAGIC = "bws-touchid-passcode-v1\n"
+PASSCODE_MIN_LEN = 8
+PASSCODE_MAX_LEN = 128
+PASSCODE_MAX_FAILURES = 5
+PASSCODE_BACKOFF_S = 5.0        # after the n-th failure the next try waits PASSCODE_BACKOFF_S * 4**(n-1)
+PASSCODE_WINDOW_S = 120         # passcode leg deadline (same as Touch ID)
+PASSCODE_DECRYPT_S = 30         # one scrypt decrypt (work factor 18 is ~1 s)
+PASSCODE_WORK_FACTOR = 18       # age scrypt log2(N); age refuses to decrypt above 22
+PASSCODE_STATE = os.path.join(CONF_DIR, "passcode-state.json")
+OSASCRIPT = "/usr/bin/osascript"
 SAME_USER_RISK = (
     "WARNING: iphone-setup creates a second Secure Enclave identity with NO biometry and encrypts copies of "
     "your Bitwarden machine tokens to it, so a phone approval can be served without Touch ID. Any process "
@@ -144,6 +162,8 @@ DEFAULTS = {
     "prefer_device_file": PREFER_DEVICE_FILE, # last-active device id, forwarded as a routing hint
     "provider": "bitwarden",                  # secret backend behind the gate (see PROVIDERS below)
     "age_plugin_se_path": "",
+    "age_plugin_batchpass_path": "",          # passcode approver: age's scrypt plugin (age >= 1.3)
+    "osascript_path": "",                     # passcode dialog (default /usr/bin/osascript)
 }
 
 
@@ -571,6 +591,294 @@ def bound_fps(c):
     return out
 
 
+# --- passcode copies: the token sealed with age's scrypt passphrase recipient
+#
+# The passcode is a decryption key, not a comparison: tokens/<name>.passcode.age is a normal age file
+# with one scrypt stanza (random 16-byte salt per file, log2 N = PASSCODE_WORK_FACTOR, ChaCha20-Poly1305),
+# written and read by `age -j batchpass`. The passcode reaches age only through AGE_PASSPHRASE_FD, the
+# read end of a pipe this process filled; never argv, never the environment, never a file.
+
+def passcode_token_path(name):
+    if not NAME_RE.match(name or ""):
+        raise ValueError("bad token name")
+    return os.path.join(TOKENS_DIR, name + ".passcode.age")
+
+
+def passcode_copy_names():
+    suffix = ".passcode.age"
+    try:
+        files = os.listdir(TOKENS_DIR)
+    except OSError:
+        return []
+    return sorted(f[:-len(suffix)] for f in files if f.endswith(suffix) and NAME_RE.match(f[:-len(suffix)]))
+
+
+def touchid_token_names():
+    """Names of the Touch ID token files tokens/<name>.age (NAME_RE has no dot, so no copies)."""
+    try:
+        files = os.listdir(TOKENS_DIR)
+    except OSError:
+        return []
+    return sorted(f[:-4] for f in files if f.endswith(".age") and NAME_RE.match(f[:-4]))
+
+
+def seal_passcode_payload(token, name):
+    """The token name is sealed too, so one copy cannot stand in for another (write for read)."""
+    return PASSCODE_COPY_MAGIC + json.dumps({"token": token, "name": name}, sort_keys=True)
+
+
+def open_passcode_payload(text, name):
+    """The token of a decrypted passcode copy, or None (malformed, or sealed for another token)."""
+    if not text.startswith(PASSCODE_COPY_MAGIC):
+        return None
+    try:
+        obj = json.loads(text[len(PASSCODE_COPY_MAGIC):])
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("name") != name:
+        return None
+    tok = obj.get("token")
+    return tok.strip() if isinstance(tok, str) and tok.strip() else None
+
+
+def zero(buf):
+    """Overwrite a bytearray in place. Best effort: Python str / bytes copies cannot be wiped."""
+    if isinstance(buf, bytearray):
+        buf[:] = bytes(len(buf))
+
+
+def batchpass_plugin(c):
+    return find_tool("age-plugin-batchpass", c.get("age_plugin_batchpass_path"))
+
+
+def passcode_tools(c):
+    """'' or why the passcode approver cannot run here."""
+    if not find_tool("age", c.get("age_path")):
+        return "no-age"
+    plugin = batchpass_plugin(c)
+    if not plugin or not os.path.isfile(plugin) or not os.access(plugin, os.X_OK):
+        return "no-batchpass-plugin"
+    return ""
+
+
+def passcode_pipe(secret):
+    """Read end of a pipe that holds `secret` (a bytearray) followed by EOF, for AGE_PASSPHRASE_FD."""
+    r, w = os.pipe()
+    try:
+        with memoryview(secret) as view:
+            done = 0
+            while done < len(view):
+                done += os.write(w, view[done:])
+    except OSError:
+        os.close(r)
+        raise
+    finally:
+        os.close(w)
+    return r
+
+
+def batchpass_cmd(c, fd, decrypt, path):
+    """argv + env for `age -j batchpass`; the passcode is on fd (inherited), never in either."""
+    age = find_tool("age", c.get("age_path"))
+    env = tool_env()
+    env["PATH"] = os.path.dirname(os.path.abspath(batchpass_plugin(c))) + os.pathsep + env["PATH"]
+    env["AGE_PASSPHRASE_FD"] = str(fd)
+    if decrypt:
+        return [age, "-d", "-j", "batchpass", path], env
+    env["AGE_PASSPHRASE_WORK_FACTOR"] = str(PASSCODE_WORK_FACTOR)
+    return [age, "-e", "-j", "batchpass", "-o", path], env
+
+
+def passcode_result(code, out, err, name):
+    """(token, kind, error) of one passcode decrypt; kind ok | wrong | malformed | error."""
+    if code != 0:
+        text = (err or b"").decode("utf-8", "replace")
+        if "incorrect passphrase" in text.lower():
+            return None, "wrong", "wrong passcode"
+        lines = text.strip().splitlines()
+        return None, "error", "passcode copy decrypt failed: %s" % clean(lines[-1] if lines else "exit %d" % code, 160)
+    tok = open_passcode_payload((out or b"").decode("utf-8", "replace"), name)
+    if not tok:
+        return None, "malformed", "passcode copy is malformed or sealed for another token"
+    return tok, "ok", ""
+
+
+def open_passcode_copy(c, name, secret):
+    """Decrypt tokens/<name>.passcode.age with the passcode (blocking; CLI use). (token, kind, error)."""
+    fd = passcode_pipe(secret)
+    try:
+        argv, env = batchpass_cmd(c, fd, True, passcode_token_path(name))
+        r = subprocess.run(argv, env=env, pass_fds=(fd,), stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=PASSCODE_DECRYPT_S)
+    except subprocess.TimeoutExpired:
+        return None, "error", "passcode decrypt timed out"
+    finally:
+        os.close(fd)
+    return passcode_result(r.returncode, r.stdout, r.stderr, name)
+
+
+def seal_passcode_copy(c, secret, token, name):
+    """Encrypt `token` to tokens/<name>.passcode.age.tmp (0600) with the passcode. '' or an error; the
+    caller renames the .tmp files once every copy is sealed."""
+    tmp = passcode_token_path(name) + ".tmp"
+    fd = passcode_pipe(secret)
+    old = os.umask(0o077)
+    try:
+        argv, env = batchpass_cmd(c, fd, False, tmp)
+        r = subprocess.run(argv, input=seal_passcode_payload(token, name).encode(), env=env, pass_fds=(fd,),
+                           capture_output=True, timeout=PASSCODE_DECRYPT_S)
+    except subprocess.TimeoutExpired:
+        return "age timed out"
+    finally:
+        os.close(fd)
+        os.umask(old)
+    if r.returncode != 0 or not os.path.isfile(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return clean(r.stderr.decode("utf-8", "replace"), 200) or "exit %d" % r.returncode
+    os.chmod(tmp, 0o600)
+    return ""
+
+
+# --- passcode attempt counter: PASSCODE_STATE, 0600, flock'd read-modify-write
+#
+# Missing, unsafe (symlink, not ours, group/other bits) or corrupt state = locked: deleting the file
+# does not reset the counter. Every attempt is counted BEFORE the decrypt runs (a verify that is killed
+# still counts) and only a correct passcode or Touch ID (passcode unlock / set / change) resets it.
+
+def passcode_backoff(failures):
+    return 0.0 if failures < 1 else PASSCODE_BACKOFF_S * 4 ** (failures - 1)
+
+
+def _pc_state_open(create=False):
+    """An exclusively locked fd of PASSCODE_STATE, or None (missing or unsafe)."""
+    try:
+        fd = os.open(PASSCODE_STATE, os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0), 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077:
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def _pc_read(fd):
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        st = json.loads(os.read(fd, 4096).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict):
+        return None
+    f, last, locked = st.get("failures"), st.get("last_failure"), st.get("locked")
+    if not isinstance(f, int) or isinstance(f, bool) or f < 0 or not isinstance(last, (int, float)) \
+            or isinstance(last, bool) or not isinstance(locked, bool):
+        return None
+    return {"failures": f, "last_failure": float(last), "locked": locked}
+
+
+def _pc_write(fd, st):
+    data = json.dumps({"v": 1, "failures": st["failures"], "last_failure": st["last_failure"],
+                       "locked": st["locked"]}).encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, data)
+    os.fsync(fd)
+
+
+def passcode_state():
+    """{"failures", "last_failure", "locked"}, or None = missing / unsafe / corrupt (= locked)."""
+    fd = _pc_state_open()
+    if fd is None:
+        return None
+    try:
+        return _pc_read(fd)
+    finally:
+        os.close(fd)
+
+
+def passcode_check(st, now):
+    """(why, wait_s): why '' = a passcode may be tried now; "locked" or "backoff" otherwise."""
+    if st is None:
+        return "locked(state-missing-or-unsafe)", 0.0
+    if st["locked"] or st["failures"] >= PASSCODE_MAX_FAILURES:
+        return "locked", 0.0
+    wait = st["last_failure"] + passcode_backoff(st["failures"]) - now
+    return ("backoff", wait) if wait > 0 else ("", 0.0)
+
+
+def passcode_begin_attempt(now=None):
+    """Atomically check and count one attempt, before it is verified. (failures now, why); why '' = go."""
+    now = time.time() if now is None else now
+    fd = _pc_state_open()
+    if fd is None:
+        return None, "locked(state-missing-or-unsafe)"
+    try:
+        st = _pc_read(fd)
+        why, _wait = passcode_check(st, now)
+        if why:
+            return (st or {}).get("failures"), why
+        st["failures"] += 1
+        st["last_failure"] = now
+        st["locked"] = st["failures"] >= PASSCODE_MAX_FAILURES
+        _pc_write(fd, st)
+        return st["failures"], ""
+    finally:
+        os.close(fd)
+
+
+def passcode_reset(create=False):
+    """Clear failures and lockout: after a correct passcode, or (create=True) after Touch ID in
+    passcode set / change / unlock, which also replaces a missing or unsafe state file."""
+    fd = _pc_state_open(create)
+    if fd is None and create:
+        try:
+            os.remove(PASSCODE_STATE)   # unsafe (symlink, wrong mode): the owner just used Touch ID
+        except OSError:
+            pass
+        fd = _pc_state_open(True)
+    if fd is None:
+        return False
+    try:
+        _pc_write(fd, {"failures": 0, "last_failure": 0, "locked": False})
+        return True
+    finally:
+        os.close(fd)
+
+
+def passcode_failed(c, tname, failures, kind, how):
+    """Audit + lockout notice for one failed attempt (never the passcode itself)."""
+    locked = failures is not None and failures >= PASSCODE_MAX_FAILURES
+    log({"op": "passcode", "result": "locked" if locked else kind, "token": tname,
+         "detail": "failures=%s/%d via=%s" % (failures, PASSCODE_MAX_FAILURES, how)})
+    if locked:
+        notify("bws-touchid: passcode locked", "%d wrong passcodes; Touch ID only until: bws-touchid passcode "
+               "unlock" % PASSCODE_MAX_FAILURES, c)
+
+
+def kill_group(proc):
+    """SIGTERM, then SIGKILL, the process group of a start_new_session child."""
+    if proc is None or proc.poll() is not None:
+        return
+    for sig, wait in ((signal.SIGTERM, KILL_GRACE_S), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            pass
+        try:
+            proc.wait(wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 # --- the legs
 
 class Leg(object):
@@ -892,13 +1200,196 @@ class IphoneLeg(Leg):
         return (tok, None) if tok else (None, self.error or "no iPhone token")
 
 
+# AppleScript for the passcode dialog. All text arrives through argv (on run argv); the answer leaves on
+# stdout as "P<passcode>", "T" when the dialog gave up; Deny is error -128.
+DIALOG_SCRIPT = (
+    "on run argv",
+    "set r to display dialog (item 1 of argv) with title (item 2 of argv) default answer \"\" with hidden answer "
+    "buttons {\"Deny\", \"Approve\"} default button \"Approve\" cancel button \"Deny\" with icon caution "
+    "giving up after ((item 3 of argv) as integer)",
+    "if gave up of r then return \"T\"",
+    "return \"P\" & (text returned of r)",
+    "end run",
+)
+
+
+class PasscodeLeg(Leg):
+    """A hidden-answer dialog on the broker Mac; the answer is checked by decrypting
+    tokens/<name>.passcode.age (scrypt), not compared. A wrong answer re-prompts after the backoff until
+    the lockout. The passcode travels osascript stdout -> this process (bytearray, zeroed) -> a pipe
+    fd for age, and nowhere else."""
+    name = "passcode"
+
+    def __init__(self, c, tname, deadline, prompt, notes):
+        self.c, self.tname, self.deadline, self.prompt, self.notes = c, tname, deadline, prompt, notes
+        self.proc, self.phase, self.why, self.error = None, "", "", ""
+        self.next_at, self.failures, self.verify_by, self._tok = 0.0, 0, 0.0, None
+        self.dialog = expand(c.get("osascript_path")) or OSASCRIPT
+
+    def start(self, now=None):
+        now = time.time() if now is None else now
+        path = passcode_token_path(self.tname)
+        if not os.path.lexists(path):
+            self.why = "no-passcode-copy"
+        elif not private_file_ok(path) or not safe_owned(TOKENS_DIR, True):
+            self.why = "unsafe-file-mode"
+        elif passcode_tools(self.c):
+            self.why = passcode_tools(self.c)
+        elif not os.path.isfile(self.dialog) or not os.access(self.dialog, os.X_OK):
+            self.why = "no-dialog"
+        else:
+            why, wait = passcode_check(passcode_state(), now)
+            if why == "backoff" and now + wait >= self.deadline - 5:
+                self.why = "backoff(%ds)" % int(wait + 1)
+            elif why and why != "backoff":
+                self.why = why
+        if self.why:
+            return False
+        self.live, self.phase, self.next_at = True, "wait", now   # the first poll shows the dialog
+        return True
+
+    def _show(self, now):
+        text = self.prompt
+        if self.failures:
+            text += "\n\nWrong passcode (%d of %d attempts used)." % (self.failures, PASSCODE_MAX_FAILURES)
+        text += "\n\nEnter your bws-touchid passcode to approve."
+        argv = [self.dialog]
+        for line in DIALOG_SCRIPT:
+            argv += ["-e", line]
+        argv += [text, "bws-touchid passcode", str(max(1, int(self.deadline - now)))]
+        self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     bufsize=0, env={"PATH": "/usr/bin:/bin", "HOME": HOME}, start_new_session=True)
+        self.phase = "prompt"
+
+    def _end(self, kind, why):
+        self.live = False
+        self._reap()
+        return {"kind": kind, "approver": "passcode", "why": why}
+
+    def _reap(self):
+        if self.proc is not None:
+            for f in (self.proc.stdout, self.proc.stderr):
+                try:
+                    if f:
+                        f.close()
+                except OSError:
+                    pass
+
+    def poll(self, now):
+        if not self.live:
+            return None
+        if self.phase == "wait":
+            if now >= self.deadline:
+                return self._end("unavailable", "timeout")
+            if now < self.next_at:
+                return None
+            why, wait = passcode_check(passcode_state(), now)
+            if why == "backoff":
+                self.next_at = now + wait
+                return None
+            if why:
+                return self._end("unavailable", why)
+            self._show(now)
+            return None
+        if self.proc.poll() is None:
+            if now >= self.deadline or (self.phase == "verify" and now >= self.verify_by):
+                self.cancel("timeout")
+                return {"kind": "unavailable", "approver": "passcode", "why": "timeout"}
+            return None
+        return self._answered(now) if self.phase == "prompt" else self._verified(now)
+
+    def _answered(self, now):
+        buf = bytearray(PASSCODE_MAX_LEN * 4 + 8)
+        n = 0
+        try:
+            with memoryview(buf) as view:
+                while n < len(buf):
+                    k = self.proc.stdout.readinto(view[n:])
+                    if not k:
+                        break
+                    n += k
+            err = self.proc.stderr.read(4096) or b""
+        except OSError:
+            err = b""
+        self._reap()
+        try:
+            if self.proc.returncode != 0:
+                return self._end("deny", "cancel") if b"(-128)" in err else self._end("unavailable", "dialog-error")
+            while n and buf[n - 1] in (10, 13):
+                n -= 1
+            if n and buf[0] == ord("T"):
+                return self._end("unavailable", "gave-up")
+            if not n or buf[0] != ord("P") or n == len(buf):
+                return self._end("unavailable", "dialog-error")
+            if n == 1:                    # empty answer: no attempt, ask again
+                self._show(now)
+                return None
+            failures, why = passcode_begin_attempt(now)
+            if why:
+                return self._end("unavailable", why)
+            self.failures = failures
+            secret = buf[1:n]             # a bytearray slice: one copy, zeroed below
+            try:
+                fd = passcode_pipe(secret)
+            finally:
+                zero(secret)
+            try:
+                argv, env = batchpass_cmd(self.c, fd, True, passcode_token_path(self.tname))
+                self.proc = subprocess.Popen(argv, env=env, pass_fds=(fd,), stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            finally:
+                os.close(fd)
+            self.phase, self.verify_by = "verify", now + PASSCODE_DECRYPT_S
+            return None
+        finally:
+            zero(buf)
+
+    def _verified(self, now):
+        out, err = self.proc.communicate()
+        tok, kind, error = passcode_result(self.proc.returncode, out, err, self.tname)
+        del out
+        if tok:
+            passcode_reset()
+            self._tok = tok
+            return self._end("approve", "")
+        self.error = error
+        passcode_failed(self.c, self.tname, self.failures, kind, "dialog")
+        self.notes.append("passcode-%s:%s" % (kind, self.failures))
+        if kind == "malformed":           # right passcode, wrong file: someone swapped copies
+            return self._end("deny", "copy-mismatch")
+        if self.failures >= PASSCODE_MAX_FAILURES:
+            return self._end("unavailable", "locked")
+        self.phase, self.next_at = "wait", now + passcode_backoff(self.failures)
+        return None
+
+    def cancel(self, reason):
+        if self.live and self.phase == "verify" and self.proc.poll() is None:
+            try:   # let a running verify finish so the counter is settled by its real outcome
+                self.proc.wait(PASSCODE_DECRYPT_S)
+            except subprocess.TimeoutExpired:
+                pass
+            if self.proc.returncode == 0:
+                tok = passcode_result(0, self.proc.stdout.read(), b"", self.tname)[0]
+                if tok:
+                    passcode_reset()
+                del tok
+        kill_group(self.proc)
+        self._reap()
+        self.live = False
+
+    def token(self):
+        tok, self._tok = self._tok, None
+        return (tok, None) if tok else (None, self.error or "no passcode token")
+
+
 def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
     """Get one approval and the decrypted token. Returns (token, None) or (None, (result, detail, error)).
     Sets rec approver / request_id / notes for the audit line.
 
     Deadlines: the Touch ID leg keeps its 120 s; a live iPhone leg may answer until expires_at
     (created_at + approval_wait_s, default 300) + PHONE_GRACE_S. The gate waits for the later of the
-    legs it actually has, so with the phone unavailable Touch ID behaves exactly as before."""
+    legs it actually has, so with the phone unavailable Touch ID behaves exactly as before. The opt-in
+    passcode leg shows its dialog for PASSCODE_WINDOW_S and races the others the same way."""
     if is_default_approvers(c):  # exactly the pre-approver behaviour
         notify(title, msg, c)
         token, err = decrypt_token(tname, c)
@@ -913,36 +1404,47 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
     created = canon["created_at"]
     deadline_touchid = created + TOUCHID_WINDOW_S
     deadline_phone = canon["expires_at"] + PHONE_GRACE_S
-    phone = touch = None
+    deadline_pc = created + PASSCODE_WINDOW_S
+    phone = touch = pc = None
     try:
         if "iphone" in approvers:
             phone = IphoneLeg(c, canon, tname, prefer_device)
             if not phone.start():
                 notes.append("iphone-unavailable:" + phone.why)
                 phone = None
-        if "touchid" not in approvers:
-            deadline = deadline_phone
-        else:
-            deadline = max(deadline_touchid, deadline_phone) if phone is not None else deadline_touchid
+        if "passcode" in approvers:
+            pc = PasscodeLeg(c, tname, deadline_pc, "%s\n%s" % (clean(title, 80), clean(msg, 200)), notes)
+            if not pc.start():
+                notes.append("passcode-unavailable:" + pc.why)
+                pc = None
+        ends = ([deadline_touchid] if "touchid" in approvers else []) + ([deadline_phone] if phone else []) + \
+            ([deadline_pc] if pc else [])
+        deadline = max(ends) if ends else deadline_phone
         window = int(deadline - created)
+        who = "Touch ID or iPhone" if "passcode" not in approvers else \
+            " or ".join({"touchid": "Touch ID", "iphone": "iPhone", "passcode": "passcode"}[a] for a in approvers)
         if "touchid" in approvers:
-            notify(title, msg + (" — or approve on iPhone" if phone else ""), c)
+            notify(title, msg + (" — or approve on iPhone" if phone else "") + (" — or enter passcode" if pc else ""), c)
             touch = TouchIdLeg(c, tname, deadline_touchid)
             if not touch.start():
                 notes.append("touchid-unavailable:start")
-        legs = [x for x in (phone, touch) if x is not None]
+        elif pc:
+            notify(title, msg + " — enter passcode" + (" or approve on iPhone" if phone else ""), c)
+        legs = [x for x in (phone, pc, touch) if x is not None]
         while True:
             now = time.time()
             if now >= deadline:
                 for leg in legs:
                     leg.cancel("timeout")
-                return None, ("timeout", "", "no approval within %ds (Touch ID or iPhone)" % window)
+                return None, ("timeout", "", "no approval within %ds (%s)" % (window, who))
             live = [x for x in legs if x.live]
             if not live:
-                if touch is not None and touch.error and phone is None:
+                if touch is not None and touch.error and phone is None and "passcode" not in approvers:
                     return None, ("auth-failed", touch.error, touch.error)  # today's error
-                return None, ("no-approver", "",
-                              "no approver available (Touch ID unavailable, iPhone not connected)")
+                if "passcode" not in approvers:
+                    return None, ("no-approver", "",
+                                  "no approver available (Touch ID unavailable, iPhone not connected)")
+                return None, ("no-approver", "", "no approver available (%s)" % ", ".join(notes[-3:] or ["none"]))
             socks = [x.fileno_or_none() for x in live if x.fileno_or_none() is not None]
             if socks:
                 select.select(socks, [], [], 0.1)
@@ -974,6 +1476,19 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
                     if d["kind"] == "deny":
                         return None, ("denied", "by=touchid", touch.error)
                     return touch.token()[0], None
+                if leg is pc:
+                    # PROTOCOL v1 cancel reasons have no "passcode": it is a local approval on this Mac,
+                    # so the phone hears the Touch ID ones.
+                    reason = "touchid_approved" if d["kind"] == "approve" else "touchid_denied"
+                    for x in other:
+                        x.cancel(reason)
+                    if d["kind"] == "deny":
+                        if d["why"] == "cancel":
+                            return None, ("denied", "by=passcode", "denied in the passcode dialog")
+                        return None, ("denied", "by=passcode outcome=" + d["why"],
+                                      "passcode approval rejected (%s)" % d["why"])
+                    token, err = pc.token()
+                    return (token, None) if not err else (None, ("auth-failed", err, err))
                 for x in other:  # the phone decided: stop the Touch ID prompt first
                     x.cancel("phone_decided")
                 if d["kind"] == "deny":
@@ -986,7 +1501,7 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
                     return None, ("auth-failed", err, err)
                 return token, None
     finally:  # exceptions included: never leave a prompt up or the daemon waiting
-        for leg in (phone, touch):
+        for leg in (phone, pc, touch):
             if leg is not None and leg.live:
                 leg.cancel("broker_error")
 
@@ -1987,6 +2502,10 @@ def cmd_store(argv):
         die("age encrypt failed: " + err)
     log({"op": "store", "result": "ok", "token": name})
     print("stored token '%s' -> %s (decrypting it needs Touch ID)" % (name, dest))
+    if passcode_copy_names():   # sealing needs the passcode, which store never asks for
+        if os.path.lexists(passcode_token_path(name)):
+            os.remove(passcode_token_path(name))   # it held the previous token
+        print("no passcode copy for '%s' now: run bws-touchid passcode change to seal one" % name)
     if os.path.exists(RECIPIENT_IPHONE):  # already holding the plaintext: no extra prompt
         fps = bound_fps(load_config())   # keep the approvers already bound in the other copies
         err = encrypt_to(age, RECIPIENT_IPHONE, seal_iphone_payload(token, fps), iphone_token_path(name))
@@ -2003,7 +2522,7 @@ def cmd_delete(argv):
     if len(argv) != 1:
         die("usage: bws-touchid delete NAME", 2)
     found = False
-    for path in (token_path(argv[0]), iphone_token_path(argv[0])):
+    for path in (token_path(argv[0]), iphone_token_path(argv[0]), passcode_token_path(argv[0])):
         if os.path.exists(path):
             os.remove(path)
             found = True
@@ -2018,8 +2537,7 @@ def cmd_status(_argv):
     c = load_config()
     print("identity:  %s" % (IDENTITY if os.path.exists(IDENTITY) else "absent (client-only host)"))
     files = os.listdir(TOKENS_DIR) if os.path.isdir(TOKENS_DIR) else []
-    toks = sorted(f[:-4] for f in files if f.endswith(".age") and not f.endswith(".iphone.age"))
-    print("tokens:    %s" % (", ".join(toks) or "none"))
+    print("tokens:    %s" % (", ".join(touchid_token_names()) or "none"))
     reach = "unreachable"
     for p in socket_order(c):
         s = connect_first([p])
@@ -2061,23 +2579,42 @@ def cmd_status(_argv):
     finally:
         s.close()
     print("approvals.sock: %s (%s)" % (ok, sock))
+    print("passcode:  %s" % passcode_summary())
+
+
+def passcode_summary():
+    names = passcode_copy_names()
+    if not names:
+        return "not set"
+    why, wait = passcode_check(passcode_state(), time.time())
+    st = passcode_state()
+    tail = ("LOCKED (bws-touchid passcode unlock)" if why.startswith("locked") else
+            "%d/%d failed, next try in %ds" % (st["failures"], PASSCODE_MAX_FAILURES, int(wait) + 1) if why else
+            "%d/%d failed" % (st["failures"], PASSCODE_MAX_FAILURES))
+    return "set (%s), %s" % (", ".join(names), tail)
 
 
 def cmd_run(argv):
     c = load_config()
     name = c["read_token"]
-    if "--token" in argv[: argv.index("--") if "--" in argv else len(argv)]:
+    opts = argv[: argv.index("--") if "--" in argv else len(argv)]
+    if "--token" in opts:
         name = argv[argv.index("--token") + 1]
     if "--" not in argv or argv.index("--") == len(argv) - 1:
-        die("usage: bws-touchid run [--token NAME] -- CMD ARGS...", 2)
+        die("usage: bws-touchid run [--token NAME] [--passcode] -- CMD ARGS...", 2)
     cmd = argv[argv.index("--") + 1:]
-    shown = clean(" ".join(cmd), 60)
-    notify("Touch ID: run with token '%s'" % name, "%s [%s]" % (shown, clean(proc_chain(os.getppid(), 2), 50)), c)
-    token, err = decrypt_token(name, c)
-    if err:
-        die(err)
+    if "--passcode" in opts:   # Touch ID unavailable (ssh session, lid closed): the passcode on this tty
+        if "passcode" not in (approvers_of(c) or []):
+            die('the passcode approver is off (add "passcode" to approvers in %s)' % CONFIG_PATH, 2)
+        token = passcode_unseal_tty(c, name, "run")
+    else:
+        shown = clean(" ".join(cmd), 60)
+        notify("Touch ID: run with token '%s'" % name, "%s [%s]" % (shown, clean(proc_chain(os.getppid(), 2), 50)), c)
+        token, err = decrypt_token(name, c)
+        if err:
+            die(err)
     log({"op": "run", "result": "exec", "token": name, "caller": proc_chain(os.getppid(), 2),
-         "detail": os.path.basename(cmd[0])})
+         "approver": "passcode" if "--passcode" in opts else "", "detail": os.path.basename(cmd[0])})
     env = dict(os.environ)
     env["BWS_ACCESS_TOKEN"] = token
     try:
@@ -2297,6 +2834,194 @@ def cmd_iphone_teardown(argv):
     print("If the copies may already have been read, rotate the machine tokens in Bitwarden and re-store them.")
 
 
+# ------------------------------------------------------- passcode approver admin
+
+PASSCODE_USAGE = "usage: bws-touchid passcode set | change | remove | status | unlock"
+
+
+def read_passcode_tty(prompt):
+    """getpass on the controlling terminal (no echo), as a bytearray the caller zeroes. Never a pipe,
+    argv or env: without a /dev/tty this refuses instead of letting getpass fall back to echoing stdin."""
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
+    except OSError:
+        die("the passcode is typed on a terminal and there is none here (/dev/tty); nothing changed", 2)
+    s = getpass.getpass(prompt)
+    b = bytearray(s.encode("utf-8"))
+    del s
+    return b
+
+
+def passcode_problem(secret):
+    """Why a new passcode is not acceptable, or ''."""
+    try:
+        s = secret.decode("utf-8")
+    except UnicodeDecodeError:
+        return "the passcode is not UTF-8"
+    try:
+        if len(s) < PASSCODE_MIN_LEN:
+            return "the passcode needs at least %d characters" % PASSCODE_MIN_LEN
+        if len(s) > PASSCODE_MAX_LEN:
+            return "the passcode may have at most %d characters" % PASSCODE_MAX_LEN
+        if not all(ch.isprintable() for ch in s) or s != s.strip():
+            return "the passcode may not contain control characters or leading/trailing spaces"
+        return ""
+    finally:
+        del s
+
+
+def passcode_unseal_tty(c, name, how):
+    """The token from tokens/<name>.passcode.age, passcode typed on this tty; counted like the dialog."""
+    path = passcode_token_path(name)
+    if not os.path.lexists(path):
+        die("no passcode copy for token '%s' (bws-touchid passcode set)" % name)
+    if not private_file_ok(path) or not safe_owned(TOKENS_DIR, True):
+        die("refusing %s: not a 0600 file you own in a private tokens dir" % path)
+    if passcode_tools(c):
+        die("passcode approver unavailable: %s (age >= 1.3 ships age-plugin-batchpass)" % passcode_tools(c))
+    why, wait = passcode_check(passcode_state(), time.time())
+    if why == "backoff":
+        die("too many wrong passcodes: try again in %ds" % (int(wait) + 1), 5)
+    if why:
+        die("passcode locked; only Touch ID unlocks it: bws-touchid passcode unlock", 5)
+    secret = read_passcode_tty("Passcode for token '%s' (hidden): " % name)
+    try:
+        failures, why = passcode_begin_attempt()
+        if why:
+            die("passcode %s" % why, 5)
+        tok, kind, err = open_passcode_copy(c, name, secret)
+    finally:
+        zero(secret)
+    if tok:
+        passcode_reset()
+        return tok
+    passcode_failed(c, name, failures, kind, how)
+    die("%s (%d of %d attempts used)" % (err, failures, PASSCODE_MAX_FAILURES), 5)
+
+
+def passcode_set(c, sub):
+    """set / change: Touch ID for every token first, then the new passcode twice, then re-seal."""
+    have = passcode_copy_names()
+    if sub == "set" and have:
+        die("a passcode is already set (copies: %s); use: bws-touchid passcode change" % ", ".join(have), 2)
+    if sub == "change" and not have:
+        die("no passcode set; use: bws-touchid passcode set", 2)
+    if passcode_tools(c):
+        die("passcode approver unavailable: %s (age >= 1.3 ships age-plugin-batchpass)" % passcode_tools(c))
+    names = touchid_token_names()
+    if not names:
+        die("no Touch ID tokens stored yet (bws-touchid store NAME)")
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
+    except OSError:
+        die("passcode %s needs a terminal (/dev/tty); nothing changed" % sub, 2)
+    for d in (CONF_DIR, TOKENS_DIR):
+        os.chmod(d, 0o700)
+    tokens, sealed, secret = {}, [], None
+    try:
+        for name in names:
+            print("Touch ID for token '%s'…" % name)
+            notify("Touch ID: passcode %s (token '%s')" % (sub, name), "bws-touchid passcode " + sub, c)
+            tok, err = decrypt_token(name, c)
+            if err:
+                log({"op": "passcode-" + sub, "result": "auth-failed", "token": name})
+                die(err)
+            tokens[name] = tok
+            del tok
+        secret = read_passcode_tty("New passcode (at least %d characters, hidden): " % PASSCODE_MIN_LEN)
+        problem = passcode_problem(secret)
+        if problem:
+            log({"op": "passcode-" + sub, "result": "rejected", "detail": "too weak or malformed"})
+            die(problem + "; nothing changed")
+        again = read_passcode_tty("Repeat it: ")
+        same = hmac.compare_digest(secret, again)
+        zero(again)
+        if not same:
+            log({"op": "passcode-" + sub, "result": "rejected", "detail": "mismatch"})
+            die("the two passcodes differ; nothing changed")
+        for name in names:
+            err = seal_passcode_copy(c, secret, tokens[name], name)
+            if err:
+                for n in sealed:
+                    os.remove(passcode_token_path(n) + ".tmp")
+                die("age encrypt failed for '%s': %s; nothing changed" % (name, err))
+            sealed.append(name)
+    finally:
+        tokens.clear()
+        zero(secret)
+    for name in sealed:
+        os.replace(passcode_token_path(name) + ".tmp", passcode_token_path(name))
+    for name in passcode_copy_names():
+        if name not in sealed:   # a copy of a token that no longer has a Touch ID copy
+            os.remove(passcode_token_path(name))
+    passcode_reset(create=True)
+    log({"op": "passcode-" + sub, "result": "ok", "detail": "copies=" + ",".join(sealed)})
+    print("passcode %s: sealed copies of %s (scrypt, tokens/<name>.passcode.age)" % (
+        "set" if sub == "set" else "changed", ", ".join(sealed)))
+    if "passcode" not in (approvers_of(c) or []):
+        print('next: add "passcode" to "approvers" in %s (e.g. ["touchid", "passcode"]) and restart the broker'
+              % CONFIG_PATH)
+
+
+def passcode_remove(c):
+    removed = []
+    names = sorted(os.listdir(TOKENS_DIR)) if os.path.isdir(TOKENS_DIR) else []
+    for path in [os.path.join(TOKENS_DIR, f) for f in names if f.endswith((".passcode.age", ".passcode.age.tmp"))] \
+            + [PASSCODE_STATE]:
+        if os.path.lexists(path):
+            os.remove(path)
+            removed.append(path)
+            print("removed %s" % path)
+    log({"op": "passcode-remove", "result": "ok", "detail": "%d files" % len(removed)})
+    if not removed:
+        print("no passcode set")
+    if "passcode" in (approvers_of(c) or []):
+        print('next: remove "passcode" from "approvers" in %s and restart the broker' % CONFIG_PATH)
+
+
+def passcode_unlock(c):
+    """Clear failures / the lockout. Needs Touch ID: a passcode can never unlock itself."""
+    if not passcode_copy_names():
+        die("no passcode set")
+    names = touchid_token_names()
+    name = c["read_token"] if c["read_token"] in names else (names[0] if names else c["read_token"])
+    notify("Touch ID: unlock the bws-touchid passcode", "clears %d failed attempts" %
+           ((passcode_state() or {}).get("failures") or 0), c)
+    tok, err = decrypt_token(name, c)   # owner presence; the token is discarded
+    if err:
+        log({"op": "passcode-unlock", "result": "auth-failed", "token": name})
+        die(err)
+    del tok
+    if not passcode_reset(create=True):
+        die("could not write %s" % PASSCODE_STATE)
+    log({"op": "passcode-unlock", "result": "ok"})
+    print("passcode unlocked: failed attempts reset")
+
+
+def passcode_status(c):
+    print("passcode:  %s" % passcode_summary())
+    on = "passcode" in (approvers_of(c) or [])
+    print("approver:  %s" % ("on (approvers: %s)" % ", ".join(approvers_of(c)) if on else
+                             'off (add "passcode" to "approvers" to use it)'))
+    why = passcode_tools(c)
+    print("plugin:    %s" % (batchpass_plugin(c) if not why else "MISSING: " + why))
+    print("state:     %s" % PASSCODE_STATE)
+
+
+def cmd_passcode(argv):
+    c = load_config()
+    sub = argv[0] if len(argv) == 1 else ""
+    if sub in ("set", "change"):
+        return passcode_set(c, sub)
+    if sub == "remove":
+        return passcode_remove(c)
+    if sub == "unlock":
+        return passcode_unlock(c)
+    if sub == "status":
+        return passcode_status(c)
+    die(PASSCODE_USAGE, 2)
+
+
 # ---------------------------------------------------------------- tunnels
 
 TUNNEL_PREFIX = "bws-touchid.tunnel."
@@ -2467,7 +3192,7 @@ def main():
     cmds = {"init": cmd_init, "store": cmd_store, "status": cmd_status, "delete": cmd_delete,
             "run": cmd_run, "serve": cmd_serve, "reap": cmd_reap, "save": cmd_save, "gated": cmd_gated,
             "ping": cmd_ping, "tunnel": cmd_tunnel, "approver": cmd_approver, "iphone-setup": cmd_iphone_setup,
-            "iphone-teardown": cmd_iphone_teardown, "ticket": cmd_ticket}
+            "iphone-teardown": cmd_iphone_teardown, "ticket": cmd_ticket, "passcode": cmd_passcode}
     if not argv or argv[0] not in cmds:
         print(__doc__.strip())
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)

@@ -14,7 +14,7 @@
   "denied_key_prefixes": ["OWNER_"],
   "notify": true,
   "tunnels": ["other-mac", { "host": "build-box", "remote_sock": "/Users/builder/.bws-broker/fwd.sock" }],
-  "_approvers": "[\"touchid\"] = Touch ID only (default). After bws-touchid iphone-setup --i-understand-same-user-risk + approver add: [\"touchid\", \"iphone\"]",
+  "_approvers": "[\"touchid\"] = Touch ID only (default). After bws-touchid iphone-setup --i-understand-same-user-risk + approver add: [\"touchid\", \"iphone\"]. After bws-touchid passcode set: add \"passcode\" (e.g. [\"touchid\", \"passcode\"]; any mix of touchid, iphone, passcode)",
   "approvers": ["touchid"],
   "_approval_wait_s": "how long the iPhone may answer (30-300, default 300); Touch ID keeps 120 s",
   "approval_wait_s": 300,
