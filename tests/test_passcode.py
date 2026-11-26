@@ -4,6 +4,7 @@ attempt counter / backoff / lockout, Touch ID unlock, and the `passcode` CLI on 
 Uses the same sandbox as the other tests (temp HOME, fake age / age-plugin-se / age-plugin-batchpass /
 osascript / bws). Never touches the real ~/.config/bws-touchid, ~/.bws-broker, a real dialog or Bitwarden.
 """
+import fcntl
 import json
 import os
 import pty
@@ -11,6 +12,7 @@ import re
 import select
 import signal
 import subprocess
+import threading
 import time
 import unittest
 
@@ -540,6 +542,56 @@ class TestReviewFixes(Base):
         self.assertTrue(r["ok"], r)
         self.assertIn("approver=touchid", self.last_log())
         self.assertEqual(len(self.sb.dialog_runs()), 1)
+
+    def test_busy_state_lock_does_not_hang_the_gate(self):
+        # finding 5: someone holds the counter's flock; the passcode leg gives up, Touch ID still works
+        fd = os.open(self.sb.pc_state_path, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        release = threading.Timer(8, lambda: os.close(fd))
+        release.start()
+        try:
+            mod = self.module()
+            mod.PASSCODE_LOCK_S = 0.3
+            r = self.handle(READ_REQ, mod)
+        finally:
+            release.cancel()
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.assertTrue(r["ok"], r)
+        self.assertLess(self.elapsed, 4, "the gate waited on the state lock")
+        self.assertIn("approver=touchid", self.last_log())
+        self.assertIn("passcode-unavailable:locked(state-busy)", self.last_log())
+        self.assertEqual(self.sb.dialog_runs(), [])
+        self.assertEqual(self.sb.pc_state()["failures"], 0)
+
+    def test_busy_state_lock_never_deletes_the_counter(self):
+        mod = self.module()
+        mod.PASSCODE_LOCK_S = 0.2
+        self.sb.write_pc_state(failures=3, last_failure=1)
+        fd = os.open(self.sb.pc_state_path, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        release = threading.Timer(3, lambda: fcntl.flock(fd, fcntl.LOCK_UN))   # so a blocking flock cannot hang
+        release.start()
+        t0 = time.time()
+        try:
+            self.assertEqual(mod.passcode_begin_attempt(), (None, "locked(state-busy)"))
+            self.assertFalse(mod.passcode_reset(create=True))
+            self.assertEqual(mod.passcode_check(mod.passcode_state(), time.time())[0], "locked(state-busy)")
+        finally:
+            release.cancel()
+            os.close(fd)
+        self.assertLess(time.time() - t0, 2.5)
+        self.assertEqual(self.sb.pc_state()["failures"], 3)
+
+    def test_summary_reads_the_state_once(self):
+        # finding 7: the state vanishing between two reads raised TypeError
+        mod = self.module()
+        answers = [{"failures": 1, "last_failure": time.time(), "locked": False}, None]
+        mod.passcode_state = lambda: answers.pop(0) if answers else None
+        mod.PASSCODE_BACKOFF_S = 60
+        self.assertRegex(mod.passcode_summary(), r"set \(read, write\), 1/5 failed, next try in \d+s")
 
 
 

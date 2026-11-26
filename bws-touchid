@@ -122,6 +122,7 @@ PASSCODE_WINDOW_S = 120         # passcode leg deadline (same as Touch ID)
 PASSCODE_DECRYPT_S = 30         # one scrypt decrypt (work factor 18 is ~1 s)
 PASSCODE_WORK_FACTOR = 18       # age scrypt log2(N); age refuses to decrypt above 22
 PASSCODE_STATE = os.path.join(CONF_DIR, "passcode-state.json")
+PASSCODE_LOCK_S = 2.0           # give up on the counter's flock after this (the caller holds GATE_LOCK)
 OSASCRIPT = "/usr/bin/osascript"
 SAME_USER_RISK = (
     "WARNING: iphone-setup creates a second Secure Enclave identity with NO biometry and encrypts copies of "
@@ -752,14 +753,27 @@ def passcode_backoff(failures):
     return 0.0 if failures < 1 else PASSCODE_BACKOFF_S * 4 ** (failures - 1)
 
 
+PC_BUSY = -1   # _pc_state_open: another process holds the lock past PASSCODE_LOCK_S (= locked for now)
+
+
 def _pc_state_open(create=False):
-    """An exclusively locked fd of PASSCODE_STATE, or None (missing or unsafe)."""
+    """An exclusively locked fd of PASSCODE_STATE, None (missing or unsafe), or PC_BUSY. Non-blocking
+    with a short retry: callers run under GATE_LOCK, and a stuck holder must not stall every approval."""
     try:
         fd = os.open(PASSCODE_STATE, os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0), 0o600)
     except OSError:
         return None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        end = time.time() + PASSCODE_LOCK_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= end:
+                    os.close(fd)
+                    return PC_BUSY
+                time.sleep(0.05)
         st = os.fstat(fd)
         if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077:
             return fd
@@ -794,10 +808,10 @@ def _pc_write(fd, st):
 
 
 def passcode_state():
-    """{"failures", "last_failure", "locked"}, or None = missing / unsafe / corrupt (= locked)."""
+    """{"failures", "last_failure", "locked"}, None = missing / unsafe / corrupt, or PC_BUSY (both = locked)."""
     fd = _pc_state_open()
-    if fd is None:
-        return None
+    if fd is None or fd == PC_BUSY:
+        return fd
     try:
         return _pc_read(fd)
     finally:
@@ -808,6 +822,8 @@ def passcode_check(st, now):
     """(why, wait_s): why '' = a passcode may be tried now; "locked" or "backoff" otherwise."""
     if st is None:
         return "locked(state-missing-or-unsafe)", 0.0
+    if st == PC_BUSY:
+        return "locked(state-busy)", 0.0
     if st["locked"] or st["failures"] >= PASSCODE_MAX_FAILURES:
         return "locked", 0.0
     wait = st["last_failure"] + passcode_backoff(st["failures"]) - now
@@ -818,8 +834,8 @@ def passcode_begin_attempt(now=None):
     """Atomically check and count one attempt, before it is verified. (failures now, why); why '' = go."""
     now = time.time() if now is None else now
     fd = _pc_state_open()
-    if fd is None:
-        return None, "locked(state-missing-or-unsafe)"
+    if fd is None or fd == PC_BUSY:
+        return None, passcode_check(fd, now)[0]
     try:
         st = _pc_read(fd)
         why, _wait = passcode_check(st, now)
@@ -838,13 +854,15 @@ def passcode_reset(create=False):
     """Clear failures and lockout: after a correct passcode, or (create=True) after Touch ID in
     passcode set / change / unlock, which also replaces a missing or unsafe state file."""
     fd = _pc_state_open(create)
+    if fd == PC_BUSY:   # never delete a file someone else has locked
+        return False
     if fd is None and create:
         try:
             os.remove(PASSCODE_STATE)   # unsafe (symlink, wrong mode): the owner just used Touch ID
         except OSError:
             pass
         fd = _pc_state_open(True)
-    if fd is None:
+    if fd is None or fd == PC_BUSY:
         return False
     try:
         _pc_write(fd, {"failures": 0, "last_failure": 0, "locked": False})
@@ -2615,8 +2633,8 @@ def passcode_summary():
     names = passcode_copy_names()
     if not names:
         return "not set"
-    why, wait = passcode_check(passcode_state(), time.time())
-    st = passcode_state()
+    st = passcode_state()   # once: the file may change or vanish between two reads
+    why, wait = passcode_check(st, time.time())
     tail = ("LOCKED (bws-touchid passcode unlock)" if why.startswith("locked") else
             "%d/%d failed, next try in %ds" % (st["failures"], PASSCODE_MAX_FAILURES, int(wait) + 1) if why else
             "%d/%d failed" % (st["failures"], PASSCODE_MAX_FAILURES))
@@ -3014,8 +3032,9 @@ def passcode_unlock(c):
         die("no passcode set")
     names = touchid_token_names()
     name = c["read_token"] if c["read_token"] in names else (names[0] if names else c["read_token"])
+    st = passcode_state()
     notify("Touch ID: unlock the bws-touchid passcode", "clears %d failed attempts" %
-           ((passcode_state() or {}).get("failures") or 0), c)
+           ((st if isinstance(st, dict) else {}).get("failures") or 0), c)
     tok, err = decrypt_token(name, c)   # owner presence; the token is discarded
     if err:
         log({"op": "passcode-unlock", "result": "auth-failed", "token": name})
