@@ -64,7 +64,7 @@ def batchpass(args):
     except (KeyError, ValueError, OSError) as e:
         sys.stderr.write("age: error: batchpass plugin: failed to read passphrase from fd: %s\n" % e)
         sys.exit(1)
-    secret = b"".join(chunks).rstrip(b"\n")
+    secret = b"".join(chunks).rstrip(b"\r\n")   # like age-plugin-batchpass 1.3.2: every trailing CR/LF
     decrypt = "-d" in args
     leg = "passcode" if decrypt else "passcode-encrypt"
     ctl = control("passcode") if decrypt else {}

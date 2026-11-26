@@ -663,6 +663,39 @@ class TestCliReviewFixes(Base):
         self.assertFalse([f for f in os.listdir(self.sb.tokens) if f.endswith(".tmp")])
 
 
+class TestFakeAgeNewlines(unittest.TestCase):
+    """finding 8: fake batchpass strips trailing CR/LF the way the real age 1.3.2 plugin does (verified
+    on dummy data: "pw", "pw\n", "pw\n\n", "pw\r\n", "pw\r" all open a file sealed with "pw"; "pw " does
+    not; an inner "\n" is kept)."""
+
+    def check(self, age, plugin):
+        root = Sandbox(iphone=False)
+        try:
+            out = os.path.join(root.root, "x.age")
+
+            def run(args, pw, inp=None):
+                r, w = os.pipe()
+                os.write(w, pw)
+                os.close(w)
+                env = dict(root.env(AGE_PASSPHRASE_FD=str(r), AGE_PASSPHRASE_WORK_FACTOR="10"))
+                env["PATH"] = os.path.dirname(plugin) + ":" + env["PATH"]
+                p = subprocess.run([age] + args, input=inp, env=env, pass_fds=(r,), capture_output=True)
+                os.close(r)
+                return p.returncode
+            self.assertEqual(run(["-e", "-j", "batchpass", "-o", out], b"pass\nword\n", b"dummy"), 0)
+            for pw, ok in ((b"pass\nword", True), (b"pass\nword\n\n", True), (b"pass\nword\r\n", True),
+                           (b"pass\nword\r", True), (b"pass\nword ", False), (b"password", False), (b"pass", False)):
+                self.assertEqual(run(["-d", "-j", "batchpass", out], pw) == 0, ok, pw)
+        finally:
+            root.cleanup()
+
+    def test_fake(self):
+        sb = Sandbox(iphone=False)
+        try:
+            self.check(os.path.join(sb.bin, "age"), os.path.join(sb.bin, "age-plugin-batchpass"))
+        finally:
+            sb.cleanup()
+
 
 REAL_AGE = next((p for p in ("/opt/homebrew/bin/age", "/usr/local/bin/age") if os.path.exists(p)), "")
 REAL_PLUGIN = next((p for p in ("/opt/homebrew/bin/age-plugin-batchpass", "/usr/local/bin/age-plugin-batchpass")
@@ -684,14 +717,18 @@ class TestRealAge(unittest.TestCase):
             path = mod.passcode_token_path("read")
             os.replace(path + ".tmp", path)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-            head = open(path, "rb").read(80)
-            self.assertTrue(re.match(rb"age-encryption\.org/v1\n-> scrypt \S{22} 10\n", head), head)
-            self.assertNotIn(FAKE_TOKENS["read"].encode(), open(path, "rb").read())
+            with open(path, "rb") as f:
+                data = f.read()
+            self.assertTrue(re.match(rb"age-encryption\.org/v1\n-> scrypt \S{22} 10\n", data[:80]), data[:80])
+            self.assertNotIn(FAKE_TOKENS["read"].encode(), data)
             self.assertEqual(mod.open_passcode_copy(c, "read", bytearray(PASSCODE.encode())),
                              (FAKE_TOKENS["read"], "ok", ""))
             self.assertEqual(mod.open_passcode_copy(c, "read", bytearray(b"not-the-passcode"))[:2], (None, "wrong"))
         finally:
             sb.cleanup()
+
+    def test_real_newline_handling_matches_the_fake(self):
+        TestFakeAgeNewlines("check").check(REAL_AGE, REAL_PLUGIN)
 
 
 if __name__ == "__main__":
