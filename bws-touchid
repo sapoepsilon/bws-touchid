@@ -2274,7 +2274,8 @@ def _ticket_worker(job, tid):
                 resp = job.reject("dropped: the owner denied an earlier request from this host/caller")
             else:
                 resp = job.run()
-                if job.rec.get("result") in ("denied", "timeout", "auth-failed"):  # Touch ID cancel = auth-failed
+                # a Touch ID cancel is "denied" ("auth-failed" with the default approvers)
+                if job.rec.get("result") in ("denied", "timeout", "auth-failed"):
                     TICKETS.note_refused(tid)
     except Exception as e:  # noqa: BLE001
         log({"op": job.op, "result": "error", "detail": "async " + type(e).__name__})
