@@ -477,6 +477,72 @@ class TestCli(Base):
         self.assertIn("passcode set | change | remove | status | unlock", r.stderr)
 
 
+class TestReviewFixes(Base):
+    """Security review round 1."""
+
+    def test_touchid_win_abandons_a_slow_verify_promptly(self):
+        # finding 1: Touch ID answers at ~0.8 s while the passcode verify takes 6 s
+        self.sb.set_age(touchid={"mode": "ok", "delay": 0.8}, passcode={"mode": "ok", "delay": 6})
+        self.sb.set_dialog([WRONG % 1])
+        r = self.handle(READ_REQ)
+        self.assertTrue(r["ok"], r)
+        self.assertIn("approver=touchid", self.last_log())
+        self.assertLess(self.elapsed, 4, "cancel waited for the in-flight verify")
+        self.assertEqual(self.sb.pc_state()["failures"], 1, "the abandoned attempt still counts")
+        log = "\n".join(self.sb.log_lines())
+        self.assertRegex(log, r"op=passcode result=abandoned token=read detail=failures=1/5 via=dialog "
+                              r"reason=touchid_approved")
+        self.assertIn("passcode-abandoned:1", self.last_log())
+        self.assertEqual(self.procs_alive("age"), [], "verify left running")
+
+    def test_abandoned_fifth_attempt_notifies_the_lockout(self):
+        self.sb.write_pc_state(failures=4, last_failure=0)
+        self.sb.set_age(touchid={"mode": "ok", "delay": 0.8}, passcode={"mode": "ok", "delay": 6})
+        self.sb.set_dialog([WRONG % 5])
+        r = self.handle(READ_REQ)
+        self.assertTrue(r["ok"], r)
+        self.assertIn("op=passcode result=abandoned token=read detail=failures=5/5", "\n".join(self.sb.log_lines()))
+        self.assertIn("bws-touchid: passcode locked", [t for t, _m in self.sb.notified])
+        self.assertTrue(self.sb.pc_state()["locked"])
+
+    def test_hanging_verify_waits_the_bound_once(self):
+        self.sb.write_config(dict(self.sb.config, approvers=["passcode"]))
+        self.sb.set_age(passcode={"mode": "hang"})
+        mod = self.module()
+        mod.PASSCODE_DECRYPT_S = 2
+        r = self.handle(READ_REQ, mod)
+        self.assertFalse(r["ok"])
+        self.assertLess(self.elapsed, 3.5, "the verify timeout waited twice")
+        self.assertGreaterEqual(self.elapsed, 1.9)
+        self.assertIn("passcode-unavailable:error", r["error"])
+        self.assertIn("op=passcode result=abandoned token=read detail=failures=1/5 via=dialog reason=timeout",
+                      "\n".join(self.sb.log_lines()))
+        self.assertEqual(self.sb.pc_state()["failures"], 1)
+
+    def test_tool_error_counts_but_ends_the_leg(self):
+        # finding 4: a plugin crash is not a wrong passcode: no "Wrong passcode" re-prompt
+        self.sb.write_config(dict(self.sb.config, approvers=["passcode"]))
+        self.sb.set_age(passcode={"mode": "error"})
+        self.sb.set_dialog([PASSCODE, PASSCODE])
+        r = self.handle(READ_REQ)
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(self.sb.dialog_runs()), 1, "re-prompted after a tool error")
+        self.assertIn("passcode-unavailable:error", r["error"])
+        self.assertIn("passcode-error:1", r["error"])
+        self.assertEqual(self.sb.pc_state()["failures"], 1, "still counted (conservative)")
+        self.assertIn("op=passcode result=error token=read detail=failures=1/5 via=dialog",
+                      "\n".join(self.sb.log_lines()))
+
+    def test_tool_error_falls_back_to_touchid(self):
+        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5}, passcode={"mode": "error"})
+        self.sb.set_dialog([PASSCODE, PASSCODE])
+        r = self.handle(READ_REQ)
+        self.assertTrue(r["ok"], r)
+        self.assertIn("approver=touchid", self.last_log())
+        self.assertEqual(len(self.sb.dialog_runs()), 1)
+
+
+
 REAL_AGE = next((p for p in ("/opt/homebrew/bin/age", "/usr/local/bin/age") if os.path.exists(p)), "")
 REAL_PLUGIN = next((p for p in ("/opt/homebrew/bin/age-plugin-batchpass", "/usr/local/bin/age-plugin-batchpass")
                     if os.path.exists(p)), "")

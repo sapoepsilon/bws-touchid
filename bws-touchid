@@ -1292,7 +1292,11 @@ class PasscodeLeg(Leg):
             self._show(now)
             return None
         if self.proc.poll() is None:
-            if now >= self.deadline or (self.phase == "verify" and now >= self.verify_by):
+            if self.phase == "verify" and now >= self.verify_by:   # a stuck age: a tool error, not a guess
+                self.cancel("timeout")
+                self.error = "passcode decrypt timed out"
+                return {"kind": "unavailable", "approver": "passcode", "why": "error"}
+            if now >= self.deadline:
                 self.cancel("timeout")
                 return {"kind": "unavailable", "approver": "passcode", "why": "timeout"}
             return None
@@ -1337,6 +1341,12 @@ class PasscodeLeg(Leg):
                 argv, env = batchpass_cmd(self.c, fd, True, passcode_token_path(self.tname))
                 self.proc = subprocess.Popen(argv, env=env, pass_fds=(fd,), stdin=subprocess.DEVNULL,
                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            except (OSError, TypeError, ValueError) as e:   # age vanished since start(): counted, not a guess
+                self.proc = None
+                self.error = "passcode decrypt failed: %s" % clean(e, 120)
+                passcode_failed(self.c, self.tname, failures, "error", "dialog")
+                self.notes.append("passcode-error:%s" % failures)
+                return self._end("unavailable", "error")
             finally:
                 os.close(fd)
             self.phase, self.verify_by = "verify", now + PASSCODE_DECRYPT_S
@@ -1357,21 +1367,40 @@ class PasscodeLeg(Leg):
         self.notes.append("passcode-%s:%s" % (kind, self.failures))
         if kind == "malformed":           # right passcode, wrong file: someone swapped copies
             return self._end("deny", "copy-mismatch")
+        if kind == "error":               # plugin crash, OOM, missing plugin: counted, but no "Wrong passcode"
+            return self._end("unavailable", "error")
         if self.failures >= PASSCODE_MAX_FAILURES:
             return self._end("unavailable", "locked")
         self.phase, self.next_at = "wait", now + passcode_backoff(self.failures)
         return None
 
     def cancel(self, reason):
-        if self.live and self.phase == "verify" and self.proc.poll() is None:
-            try:   # let a running verify finish so the counter is settled by its real outcome
-                self.proc.wait(PASSCODE_DECRYPT_S)
-            except subprocess.TimeoutExpired:
-                pass
-            if self.proc.returncode == 0:
-                tok = passcode_result(0, self.proc.stdout.read(), b"", self.tname)[0]
+        """Stop at once (the caller holds GATE_LOCK). A verify still running is killed: its attempt was
+        counted before it started, so it stays counted and is logged as abandoned. One that already
+        finished but was not read yet is settled by its real outcome."""
+        if self.live and self.phase == "verify" and self.proc is not None:
+            if self.proc.poll() is None:
+                kill_group(self.proc)
+                locked = self.failures >= PASSCODE_MAX_FAILURES
+                log({"op": "passcode", "result": "abandoned", "token": self.tname,
+                     "detail": "failures=%s/%d via=dialog reason=%s%s" % (
+                         self.failures, PASSCODE_MAX_FAILURES, clean(reason, 40), " locked" if locked else "")})
+                self.notes.append("passcode-abandoned:%s" % self.failures)
+                if locked:
+                    notify("bws-touchid: passcode locked", "%d passcode attempts; Touch ID only until: bws-touchid "
+                           "passcode unlock" % PASSCODE_MAX_FAILURES, self.c)
+            else:
+                try:
+                    out, err = self.proc.communicate(timeout=1)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    out, err = b"", b""
+                tok, kind, _error = passcode_result(self.proc.returncode, out, err, self.tname)
+                del out
                 if tok:
                     passcode_reset()
+                else:
+                    passcode_failed(self.c, self.tname, self.failures, kind, "dialog")
+                    self.notes.append("passcode-%s:%s" % (kind, self.failures))
                 del tok
         kill_group(self.proc)
         self._reap()
