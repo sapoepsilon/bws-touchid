@@ -2,9 +2,10 @@
 
 The broker has two halves:
 
-- **the approval gate** (`approve_gate`): who may approve (Touch ID, iPhone), the race, deadlines, the
-  audit fields, and unsealing the credential the operation needs (`tokens/<name>.age`, or the
-  `.iphone.age` copy after a verified phone signature);
+- **the approval gate** (`approve_gate`): who may approve (Touch ID, iPhone, passcode), the race, deadlines,
+  the audit fields, and unsealing the credential the operation needs (`tokens/<name>.age`, the
+  `.iphone.age` copy after a verified phone signature, or the `.passcode.age` copy the passcode decrypts,
+  see [PASSCODE.md](PASSCODE.md));
 - **the provider**: which credential an operation needs, how a request is parsed and summarised for the
   prompt, and how `list` / `get` / `save` talk to the backend.
 

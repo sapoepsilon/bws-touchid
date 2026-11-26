@@ -135,7 +135,9 @@ hosts only `broker_name` and `local_broker` are used.
 | `local_broker` | clients: `false` = never use this Mac's own `broker.sock`, only `fwd.sock` (default `true`) |
 | `tunnels` | broker Mac: hosts that get a persistent tunnel, `"alias"` or `{"host", "remote_sock"}` |
 | `tunnel_ssh_options` | extra `-o` options for the tunnels, e.g. `["ConnectTimeout=5"]` |
-| `approvers` | who may approve a gated op: `["touchid"]` (default, unchanged behaviour), `["touchid","iphone"]` (race), `["iphone"]` (lid-closed). Anything else refuses every save/read |
+| `approvers` | who may approve a gated op: `["touchid"]` (default, unchanged behaviour), `["touchid","iphone"]` (race), `["iphone"]` (lid-closed), and `"passcode"` in any mix (`["touchid","passcode"]`, `["touchid","iphone","passcode"]`, `["passcode"]`). Anything else refuses every save/read |
+| `age_plugin_batchpass_path` | passcode approver: `age-plugin-batchpass` (default: found on `PATH`; ships with age ≥ 1.3) |
+| `osascript_path` | passcode approver: the dialog program (default `/usr/bin/osascript`) |
 | `approvals_socket` | the whispera-link daemon's socket (default `~/.whispera-link/approvals.sock`) |
 | `approvals_peer_paths` | optional list of executables allowed to serve `approvals_socket` (checked with `proc_pidpath`); empty = any process running as you |
 | `approvers_dir` | pinned iPhone approve keys, `<device_id>.pub` (default `~/.bws-broker/approvers`) |
@@ -214,6 +216,32 @@ iPhone copy to a key whose release needs the phone: the phone returns a one-time
 bound to the `request_id`) only after Face ID, so the Mac alone can never unseal a copy. Until then, use
 `iphone-teardown` if you don't need lid-closed approvals.
 
+## Passcode approver (optional)
+
+For when Touch ID cannot answer (lid closed, no sensor, ssh session) or you would rather type. Off by default.
+Details and the crypto design: [docs/PASSCODE.md](docs/PASSCODE.md).
+
+```bash
+bws-touchid passcode set        # Touch ID per token first, then the passcode twice (hidden; ≥ 8 characters)
+# add "passcode" to "approvers", e.g. ["touchid", "passcode"], then
+launchctl kickstart -k gui/$(id -u)/bws-touchid.broker
+bws-touchid passcode status     # copies, failed attempts, lockout
+bws-touchid run --passcode -- bws secret list   # terminal entry instead of Touch ID
+```
+
+- Each token gets a passcode copy `tokens/<name>.passcode.age`: age's scrypt passphrase recipient (via
+  `age-plugin-batchpass`, the passcode on a pipe fd, never argv or env). The passcode decrypts the token;
+  there is no hash compare in front of plaintext.
+- A gated op shows a hidden-answer dialog on the broker Mac next to the Touch ID sheet (and the iPhone
+  request); first answer wins, **Deny** in the dialog is a deny, a wrong passcode re-prompts.
+- Failed attempts are counted in `passcode-state.json` (0600): backoff 5 s · 4^(n−1), **locked after 5**,
+  and only Touch ID clears it (`bws-touchid passcode unlock` / `passcode change`). Each failure is logged
+  without the passcode.
+- `passcode change` (Touch ID) re-seals with a new passcode; `passcode remove` deletes the copies.
+
+**Residual risk:** any process running as you can read the copies and guess offline at scrypt cost, and can
+fake the dialog to phish the passcode. Use a long passphrase; the attempt counter only limits the dialog.
+
 ## Async tickets (callers with a short timeout)
 
 MCP tools are killed after 60 s, shorter than a 5-minute phone approval. Ask asynchronously and collect later:
@@ -244,7 +272,7 @@ approval slot before it gets "broker busy". One host + caller may have 8 tickets
 of its requests (or let it time out), the requests it queued before that are dropped without a prompt.
 
 Timeouts nest so a slow approval ends with a broker error, never a client that gave up first: Touch ID
-120 s ≤ iPhone 300 s (+5 s grace) < broker connection 495 s < client 535 s.
+120 s = passcode dialog 120 s ≤ iPhone 300 s (+5 s grace) < broker connection 495 s < client 535 s.
 
 ## Threat model and limits
 
@@ -272,12 +300,18 @@ What it does not:
   host it came from. Only add tunnels to hosts whose requests you are willing to see at any hour.
 - Losing the Mac's Secure Enclave key (new Mac, reset) means re-storing the tokens; the `.age` files are
   useless elsewhere.
+- With the passcode approver on, the `.passcode.age` copies are only as strong as the passcode: a process
+  running as you can guess offline (scrypt, ~1 s per guess) or phish it with a fake dialog. Off by default.
 
 ## Tests
 
 ```bash
-python3 -m unittest -v      # temp HOME, fake age / age-plugin-se / bws, fake approvals socket; ~2 min
+python3 -m unittest -v      # temp HOME, fake age / age-plugin-se / age-plugin-batchpass / osascript / bws,
+                            # fake approvals socket, a pseudo-terminal for passcode entry; ~2 min
 ```
+
+`tests/test_passcode.py` also round-trips a passcode copy through the real `age` + `age-plugin-batchpass`
+when both are installed (fake token, temp dir), and skips that test otherwise.
 
 No Secure Enclave, real token, Touch ID prompt or Bitwarden call is involved. The cross-repo test
 (`tests/e2e/integration_broker.sh` in whispera-link, with this repo checked out next to it) runs this
