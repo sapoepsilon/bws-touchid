@@ -1603,8 +1603,18 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
 
         def verifying():   # a passcode typed just before the deadline: its verify (bounded by verify_by) may finish
             return pc is not None and pc.live and pc.phase == "verify"
+
+        def dialog_in_use():   # the passcode dialog is on screen, or the passcode typed in it is being checked
+            return pc is not None and pc.live and pc.phase in ("prompt", "verify")
         while True:
             now = time.time()
+            if touch_cancelled and not (pc is not None and pc.live):
+                # the passcode leg the owner switched to has ended: the Touch ID cancel is final after all
+                for leg in legs:
+                    if leg.live:
+                        leg.cancel("touchid_denied")
+                rec["approver"] = "touchid"
+                return None, ("denied", "by=touchid", touch.error)
             if now >= deadline:
                 if not verifying():
                     for leg in legs:
@@ -1615,9 +1625,6 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
                         leg.cancel("timeout")
             live = [x for x in legs if x.live]
             if not live:
-                if touch_cancelled:   # the only explicit answer was cancelling the Touch ID sheet
-                    rec["approver"] = "touchid"
-                    return None, ("denied", "by=touchid", touch.error)
                 if touch is not None and touch.error and phone is None and "passcode" not in approvers:
                     return None, ("auth-failed", touch.error, touch.error)  # today's error
                 if "passcode" not in approvers:
@@ -1647,9 +1654,11 @@ def approve_gate(c, rec, tname, title, msg, canon_fields, prefer_device=""):
                     return None, ("denied", "by=%s outcome=%s" % (d["approver"], d["why"]),
                                   "iPhone answer not accepted (%s) and no other approver" % d["why"])
                 other = [x for x in legs if x is not leg]
-                if leg is touch and d["kind"] == "deny" and d["why"] == "cancel" and any(x.live for x in other):
-                    # Cancelling the sheet only drops Touch ID while the passcode dialog or the phone is still
-                    # up, so either can be used instead; their own Deny is still final.
+                if leg is touch and d["kind"] == "deny" and d["why"] == "cancel" and dialog_in_use():
+                    # Cancelling the sheet only drops Touch ID while the passcode dialog is on screen (or its
+                    # passcode is being checked), so the owner can type the passcode instead; Deny in the
+                    # dialog is still final. Otherwise (only the phone, or the dialog in its backoff wait
+                    # with nothing on screen to Deny) a Touch ID cancel is a deny and ends every leg.
                     touch_cancelled = True
                     notes.append("touchid-cancelled")
                     continue

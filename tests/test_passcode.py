@@ -745,6 +745,24 @@ class TestRound2Gate(Base):
         self.assertIn("by=touchid", self.last_log())
         self.assertIn("passcode-unavailable:gave-up", self.last_log())
 
+    def test_cancel_during_passcode_backoff_wait_denies(self):
+        # final review 1: a wrong passcode puts the leg in its backoff wait with no dialog on screen; a
+        # Touch ID cancel then is a deny, not a hand-over to a dialog that re-opens much later
+        mod = self.module()
+        mod.PASSCODE_BACKOFF_S = 5.0
+        self.sb.set_dialog([WRONG % 1, PASSCODE], delay=0.1)
+        self.sb.set_age(touchid={"mode": "cancel", "delay": 1.5})
+        r = self.handle(READ_REQ, mod)
+        self.assertFalse(r["ok"])
+        self.assertIn("Touch ID / decrypt failed", r["error"])
+        self.assertLess(self.elapsed, 4, "waited out the backoff")
+        self.assertIn("result=denied", self.last_log())
+        self.assertIn("by=touchid", self.last_log())
+        self.assertNotIn("touchid-cancelled", self.last_log())
+        self.assertEqual(len(self.sb.dialog_runs()), 1, "the dialog re-opened after the cancel")
+        self.assertEqual(self.sb.bws_runs(), [])
+        self.assertEqual(self.procs_alive("osascript"), [])
+
     def test_touchid_cancel_without_a_passcode_leg_denies(self):
         os.remove(os.path.join(self.sb.tokens, "read.passcode.age"))   # passcode leg skipped
         self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})

@@ -402,41 +402,18 @@ class TestRace(Base):
                                   "reason": "touchid_approved"}])
         self.assertIn("approver=touchid", self.last_log())
 
-    def test_touchid_cancel_leaves_the_phone_up(self):
-        """Cancelling the Touch ID sheet while the phone leg is live only ends Touch ID: the phone may
-        still approve (an alternative, not a veto)."""
+    def test_touchid_cancel_denies(self):
         self.sb.pin(self.phone)
         self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})
-        self.start_daemon(decision="approve", delay=0.2, gate=self.sb.touchid_finished)
+        self.start_daemon(decision="silent", delay=30)
         r = self.handle(READ_REQ)
-        self.assertTrue(r["ok"], r)
-        self.assertEqual(self.sb.bws_runs()[-1]["token"], FAKE_IPHONE_TOKENS["read"])
-        self.assertIn("approver=iphone", self.last_log())
-        self.assertIn("touchid-cancelled", self.last_log())
-        self.assertNotIn("touchid_denied", [x.get("reason") for x in self.broker_lines()])
-
-    def test_touchid_cancel_then_phone_deny_denies(self):
-        self.sb.pin(self.phone)
-        self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})
-        self.start_daemon(decision="deny", delay=0.2, gate=self.sb.touchid_finished)
-        r = self.handle(READ_REQ)
-        self.assertEqual(r, {"ok": False, "error": "denied on iPhone"})
-        self.assertIn("by=iphone", self.last_log())
-        self.assertEqual(self.sb.bws_runs(), [])
-
-    def test_touchid_cancel_then_phone_silent_times_out(self):
-        self.sb.write_config(dict(self.sb.config, approval_wait_s=3))
-        self.sb.pin(self.phone)
-        self.sb.set_age(touchid={"mode": "cancel", "delay": 0.2})
-        self.start_daemon(decision="silent", delay=60)
-        mod = self.sb.module()
-        mod.TOUCHID_WINDOW_S, mod.PHONE_WINDOW_MIN, mod.PHONE_GRACE_S = 1, 1, 1
-        r = self.handle(READ_REQ, mod)
-        self.assertEqual(r, {"ok": False, "error": "no approval within 4s (Touch ID or iPhone)"})
-        self.assertLess(self.elapsed, 15)
-        self.assertIn("touchid-cancelled", self.last_log())
-        self.assertIn("result=timeout", self.last_log())
-        self.assertEqual(self.sb.bws_runs(), [])
+        self.assertFalse(r["ok"])
+        self.assertIn("Touch ID / decrypt failed", r["error"])
+        self.assertEqual([x["reason"] for x in self.broker_lines()], ["touchid_denied"])
+        self.assertIn("result=denied", self.last_log())
+        self.assertIn("by=touchid", self.last_log())
+        self.assertNotIn("touchid-cancelled", self.last_log())
+        self.assertLess(self.elapsed, 10, "waited for the phone after the cancel")
 
     def test_touchid_cancel_without_a_live_phone_denies(self):
         """Phone configured but unavailable: Touch ID is the only live approver, cancel = deny as before."""

@@ -60,11 +60,13 @@ set/change is running"). An interrupted `set` / `change` (Ctrl-C, a crash, an er
   on osascript's stdout pipe, is read into a `bytearray`, written into the age pipe and zeroed. The first
   answer wins: a right passcode approves (Touch ID sheet and phone request are cancelled), **Deny** is a deny,
   Touch ID or the phone answering first closes the dialog. **Cancelling the Touch ID sheet is not a deny while
-  the passcode dialog (or the phone request) is still up**: it only drops Touch ID, so you can cancel the sheet
-  and type the passcode instead (log note `touchid-cancelled`). To refuse, press Deny in the dialog or on the
-  phone; if nothing else answers, the request ends as denied by Touch ID once the dialog gives up, or times
-  out while the phone may still answer. With Touch ID the only live approver, cancelling it is a deny as
-  before. A wrong passcode re-opens the dialog ("Wrong
+  the passcode dialog is on screen** (or the passcode typed in it is being checked): it only drops Touch ID,
+  so you can cancel the sheet and type the passcode instead (log note `touchid-cancelled`); the phone request
+  stays up meanwhile. To refuse, press Deny in the dialog (or on the phone). When the passcode leg ends
+  without an approval (the dialog gives up, a lockout, an error) the Touch ID cancel becomes final: the
+  request is denied by Touch ID and the phone request is cancelled. At any other time (no passcode leg, or
+  the dialog waiting out a wrong-passcode backoff with nothing on screen) cancelling Touch ID is a deny that
+  ends every leg, the phone included, as without the passcode approver. A wrong passcode re-opens the dialog ("Wrong
   passcode (n of 5 attempts used)") after the backoff. The notification ends in "— or enter passcode".
   Log lines: `approver=passcode`, notes `passcode-wrong:<n>`, `passcode-unavailable:<why>`.
 - **`bws-touchid run --passcode -- CMD`** (local, interactive, e.g. in an ssh session to the broker Mac):
