@@ -29,7 +29,9 @@ ever holding the token.
 
 Every request is logged to `~/Library/Logs/bws-touchid.log`: operation, key name, project, claimed host
 and caller, and the process that actually connected (`via=local: ...` with its parent chain, or
-`via=ssh session to HOST`). Values and tokens are never logged.
+`via=ssh session to HOST`, only when the connecting process really is `/usr/bin/ssh`). Host and caller are
+whatever the client claims; they are reduced to printable ASCII, so look-alike letters, bidi and
+zero-width characters never reach a prompt or the log. Values and tokens are never logged.
 
 ## Install (the Mac with Touch ID)
 
@@ -124,13 +126,156 @@ hosts only `broker_name` and `local_broker` are used.
 |---|---|
 | `broker_name` | how agents are told whose Touch ID they are waiting for |
 | `read_token` / `write_token` | token names used by `bws-gated` / `bws-save` (default `read` / `write`) |
+| `read_tokens` | token names a read request may pick with `BWS_TOUCHID_TOKEN` (default: only `read_token`); any other name is refused, and a non-default token is named in the notification title |
 | `save_projects` | project names `bws-save` may write; the first is the default |
-| `project_names` | id → name map, only for readable notifications |
-| `denied_projects` / `denied_key_prefixes` | never read or written; also filtered out of `bws-gated` output |
+| `project_names` | id → name map. Used for readable notifications, **and** a denied project name listed here is denied by that id without a lookup |
+| `denied_projects` | project ids or names never read or written. bws output carries only `projectId`, so a denied **name** with no id in `project_names` is resolved with a live `project list` (same token) on every read; if that lookup fails nothing is read, and secrets of any project that is not visible and allowed are dropped from the output |
+| `denied_key_prefixes` | key prefixes never read or written, matched case-insensitively (`MAIL_` also blocks `Mail_x`, `mail_x`); also filtered out of `bws-gated` output |
 | `server_urls` | `--server-url` values `bws-gated` accepts (default: Bitwarden US and EU cloud) |
 | `local_broker` | clients: `false` = never use this Mac's own `broker.sock`, only `fwd.sock` (default `true`) |
 | `tunnels` | broker Mac: hosts that get a persistent tunnel, `"alias"` or `{"host", "remote_sock"}` |
 | `tunnel_ssh_options` | extra `-o` options for the tunnels, e.g. `["ConnectTimeout=5"]` |
+| `approvers` | who may approve a gated op: `["touchid"]` (default, unchanged behaviour), `["touchid","iphone"]` (race), `["iphone"]` (lid-closed), and `"passcode"` in any mix (`["touchid","passcode"]`, `["touchid","iphone","passcode"]`, `["passcode"]`). Anything else refuses every save/read |
+| `age_plugin_batchpass_path` | passcode approver: `age-plugin-batchpass` (default: found on `PATH`; ships with age ≥ 1.3) |
+| `osascript_path` | passcode approver: the dialog program (default `/usr/bin/osascript`) |
+| `tmutil_path` | passcode approver: `tmutil` for the Time Machine exclusion of the passcode copies (default: found on PATH; absent = skipped) |
+| `approvals_socket` | the whispera-link daemon's socket (default `~/.whispera-link/approvals.sock`) |
+| `approvals_peer_paths` | optional list of executables allowed to serve `approvals_socket` (checked with `proc_pidpath`); empty = any process running as you |
+| `approvers_dir` | pinned iPhone approve keys, `<device_id>.pub` (default `~/.bws-broker/approvers`) |
+| `iphone_token_identity` | no-biometry identity for the iPhone token copies (default `<conf dir>/identity-iphone.txt`) |
+| `approval_wait_s` | how long the iPhone may answer, clamped 30–300 (default 300; the old name `phone_window_s` is still read) |
+| `prefer_device_file` | file holding the last-active device id, forwarded to the daemon as a routing hint (default `~/.whispera-link/last_device`) |
+| `provider` | secret backend behind the approval gate: `bitwarden` (default, the only one shipped). See [docs/PROVIDERS.md](docs/PROVIDERS.md) |
+
+## iPhone approver (optional)
+
+With the whispera-link daemon running on the broker Mac and the Whispera iPhone app
+paired to it, every save/read can be approved either with Touch ID on the Mac or with Face ID on the phone,
+whichever answers first (whispera-link `docs/PROTOCOL.md` §7, §8, §11):
+
+- The broker builds a canonical request (op, key, summary, project, token, host, caller, via, broker, times,
+  random nonce, `request_id`) and sends it to the daemon over `approvals_socket`. The daemon only relays it.
+- The phone signs `WL1-APPROVE\n` + those exact bytes with a Secure Enclave key that needs Face ID. The
+  broker verifies the signature itself with `/usr/bin/openssl` against the key pinned in
+  `approvers/<device_id>.pub`; a bad signature or expired request from a pinned device is a **deny**.
+- The pinned key must also be **bound inside the sealed iPhone copy** of the token: each
+  `tokens/<name>.iphone.age` holds the token together with the fingerprints of the approve keys allowed to
+  release it. A pin file alone (a plain file any process running as you can write) is not enough, so
+  dropping a key into `approvers/` and answering on a fake approvals socket gets nothing.
+  `approver add` binds, `approver remove` unbinds, `store` and `iphone-setup` keep the existing bindings.
+- Answers from a device that is not a pinned, bound approver (another paired device, a rogue one, an
+  unpinned key) and unsigned denies from such devices are **ignored**: they end the phone leg but never
+  cancel Touch ID. A deny from a pinned approver is final. With `["iphone"]` alone an ignored answer is a
+  deny (fail closed).
+- At the same time the Touch ID decrypt runs as before (notification text ends in "— or approve on iPhone").
+  Whichever leg answers first wins; the other is cancelled (the Touch ID sheet is killed). A deny from a
+  pinned approver is a deny, and so is cancelling the Touch ID sheet: it cancels the phone request too and
+  counts as a refusal (the only exception is a passcode dialog that is on screen, see
+  [docs/PASSCODE.md](docs/PASSCODE.md)). Touch ID keeps its 120 s; the phone may answer for `approval_wait_s` (default 300 s), so the
+  request is denied after 305 s when the phone leg is live, after 120 s when it is not.
+- A phone approval decrypts `tokens/<name>.iphone.age` with a second Secure Enclave identity that has **no
+  biometry**; it never falls back to the Touch ID copy.
+- Daemon not running, running as another user (or not in `approvals_peer_paths` when that is set), no
+  paired device, no pinned key, no iPhone copy of the token, an iPhone identity or copy that is not a 0600
+  file you own, or no ack within 2 s: the iPhone leg is skipped and Touch ID works exactly as before, including
+  its own error messages (the log line's `detail` gains `iphone-unavailable:<why>`).
+- Pinned keys are refused when the pin file or `approvers_dir` is a symlink, not yours, or group/world-writable.
+  A bad `approvers` list refuses every gated op, dry runs included.
+- Log lines gain `approver=touchid|iphone:<device_id>|none` and `request_id=apr_…`; results `denied`,
+  `timeout`, `no-approver`. With the default `["touchid"]` the log line is exactly as before (no new fields).
+
+Setup (three Touch IDs, once). `iphone-setup` prints the risk below and does nothing unless you pass
+`--i-understand-same-user-risk`:
+
+```bash
+bws-touchid iphone-setup --i-understand-same-user-risk   # identity-iphone.txt + tokens/<read,write>.iphone.age
+whispera-link pair                        # scan the QR with the Whispera app
+bws-touchid approver add <device_id> ~/.whispera-link/keys/<device_id>.approve.pem   # one Touch ID; binds the key
+# set "approvers": ["touchid", "iphone"] in ~/.config/bws-touchid/config.json, then
+launchctl kickstart -k gui/$(id -u)/bws-touchid.broker
+bws-touchid status                        # approvers, pinned devices, iphone copies, approvals.sock
+```
+
+`bws-touchid approver list` shows pinned devices and fingerprints; `approver remove <device_id>` unpins one
+and unbinds it from the copies (no Touch ID). `bws-touchid store NAME` also writes the iPhone copy once
+`iphone-setup` has run. `bws-touchid status` marks each pin `(bound)` or `NOT bound`.
+
+Upgrading from a version without bindings: iPhone copies made before then hold the bare token and no
+approver can release them (the phone leg logs `iphone-ignored:unbound_device(legacy-copy)` and Touch ID
+still works). Run `bws-touchid approver add` once more for your phone; it re-seals every copy with the
+binding.
+
+`bws-touchid iphone-teardown [--unpin]` removes the iPhone identity and every `.iphone.age` copy (and with
+`--unpin` the pinned keys), needs no Touch ID, and leaves the Touch ID copies alone. Set `"approvers":
+["touchid"]` afterwards. If the copies may already have been read, rotate the machine tokens.
+
+**Residual risk you accept with the iPhone approver (v1):** the iPhone identity has **no biometry**, so any
+process running as you on the Mac can decrypt the `.iphone.age` copies directly, without the broker, the
+phone or Touch ID, and then holds the read and write machine tokens until you rotate them. The phone
+signature and the binding protect the broker path, not those files. The files are 0600 in a 0700 dir and
+the broker refuses to use them otherwise, which only keeps other users out. Without `iphone-setup` (the
+default) nothing changes: every token copy needs Touch ID. **Planned fix (WHI-106, option b):** wrap each
+iPhone copy to a key whose release needs the phone: the phone returns a one-time unwrap secret (HPKE-wrapped,
+bound to the `request_id`) only after Face ID, so the Mac alone can never unseal a copy. Until then, use
+`iphone-teardown` if you don't need lid-closed approvals.
+
+## Passcode approver (optional)
+
+For when Touch ID cannot answer (lid closed, no sensor, ssh session) or you would rather type. Off by default.
+Details and the crypto design: [docs/PASSCODE.md](docs/PASSCODE.md).
+
+```bash
+bws-touchid passcode set        # Touch ID per token first, then the passcode twice (hidden; ≥ 8 characters)
+# add "passcode" to "approvers", e.g. ["touchid", "passcode"], then
+launchctl kickstart -k gui/$(id -u)/bws-touchid.broker
+bws-touchid passcode status     # copies, failed attempts, lockout
+bws-touchid run --passcode -- bws secret list   # terminal entry instead of Touch ID
+```
+
+- Each token gets a passcode copy `tokens/<name>.passcode.age`: age's scrypt passphrase recipient (via
+  `age-plugin-batchpass`, the passcode on a pipe fd, never argv or env). The passcode decrypts the token;
+  there is no hash compare in front of plaintext.
+- A gated op shows a hidden-answer dialog on the broker Mac next to the Touch ID sheet (and the iPhone
+  request); first answer wins, **Deny** in the dialog is a deny, a wrong passcode re-prompts.
+- Failed attempts are counted in `passcode-state.json` (0600): backoff 5 s · 4^(n−1), **locked after 5**,
+  and only Touch ID clears it (`bws-touchid passcode unlock` / `passcode change`). Each failure is logged
+  without the passcode.
+- `passcode change` (Touch ID) re-seals with a new passcode; `passcode remove` deletes the copies.
+
+**Residual risk:** any process running as you can read the copies and guess offline at scrypt cost, and can
+fake the dialog to phish the passcode. Use a long passphrase; the attempt counter only limits the dialog.
+
+## Async tickets (callers with a short timeout)
+
+MCP tools are killed after 60 s, shorter than a 5-minute phone approval. Ask asynchronously and collect later:
+
+```bash
+bws-gated --async secret get <id>          # prints {"ticket": "tkt_…"} at once (exit 0)
+printf %s "$V" | bws-save --async KEY      # same; or set BWS_TOUCHID_ASYNC=1 for either
+bws-touchid ticket wait tkt_… [--timeout S] # long-polls (default 50 s); prints what bws-gated / bws-save would
+bws-touchid ticket get tkt_…               # one look, no waiting
+```
+
+`ticket wait|get` exit codes: 0 approved, 5 denied, 6 expired / unknown / already collected / not yours,
+75 still pending (run it again). On the socket: `{"op":"bws"|"save", …, "async":true}` → `{"ok":true,
+"status":"pending","ticket":"tkt_…","ticket_key":"…"}`, and `{"op":"ticket.get","ticket":…,"ticket_key":…,
+"host":…,"caller":…,"wait":S}` → `pending`, `approved` (`result` = the normal response), `denied` (`error`)
+or `expired`.
+
+The ticket id is not enough to collect a result: the broker also wants the `ticket_key` it handed to the
+creator (it keeps only a hash). `bws-gated --async` / `bws-save --async` keep the key in
+`~/.bws-broker/tickets/` (0600) on the requesting host, never on stdout or argv, and `ticket wait|get` read
+it from there (or from `BWS_TOUCHID_TICKET_KEY`).
+
+Results live in the broker's memory only (never on disk, never logged), are handed out **once**, and are
+dropped 10 minutes after the request finished. A ticket only answers the same uid, host and caller that
+asked (set `BWS_TOUCHID_CALLER` to the same value for both calls); anything else gets `expired`. Approvals
+stay serial: async jobs queue behind each other, and a synchronous request waits up to 30 s for the
+approval slot before it gets "broker busy". One host + caller may have 8 tickets pending; when you deny one
+of its requests (or let it time out), the requests it queued before that are dropped without a prompt.
+
+Timeouts nest so a slow approval ends with a broker error, never a client that gave up first: Touch ID
+120 s = passcode dialog 120 s ≤ iPhone 300 s (+5 s grace) < broker connection 495 s < client 535 s.
 
 ## Threat model and limits
 
@@ -158,6 +303,24 @@ What it does not:
   host it came from. Only add tunnels to hosts whose requests you are willing to see at any hour.
 - Losing the Mac's Secure Enclave key (new Mac, reset) means re-storing the tokens; the `.age` files are
   useless elsewhere.
+- With the passcode approver on, the `.passcode.age` copies are only as strong as the passcode: a process
+  running as you can guess offline (scrypt, ~1 s per guess) or phish it with a fake dialog. Off by default.
+
+## Tests
+
+```bash
+python3 -m unittest -v      # temp HOME, fake age / age-plugin-se / age-plugin-batchpass / osascript / bws,
+                            # fake approvals socket, a pseudo-terminal for passcode entry; ~2 min
+```
+
+`tests/test_passcode.py` also round-trips a passcode copy through the real `age` + `age-plugin-batchpass`
+when both are installed (fake token, temp dir), and skips that test otherwise.
+
+No Secure Enclave, real token, Touch ID prompt or Bitwarden call is involved. The cross-repo test
+(`tests/e2e/integration_broker.sh` in whispera-link, with this repo checked out next to it) runs this
+script as `serve` against the real whispera-link daemon with the same fakes in a temp HOME. The P-256 keys in
+`tests/fakes/vectors_v1.json` (whispera-link's known-answer vectors) and the ones the tests generate are
+throwaway test keys.
 
 Requires macOS with a Secure Enclave and Touch ID, Python 3.9+ (`/usr/bin/python3`), `age`,
 `age-plugin-se` and `bws` on the broker Mac. Clients need only Python.
