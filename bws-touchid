@@ -123,6 +123,7 @@ PASSCODE_DECRYPT_S = 30         # one scrypt decrypt (work factor 18 is ~1 s)
 PASSCODE_WORK_FACTOR = 18       # age scrypt log2(N); age refuses to decrypt above 22
 PASSCODE_STATE = os.path.join(CONF_DIR, "passcode-state.json")
 PASSCODE_LOCK_S = 2.0           # give up on the counter's flock after this (the caller holds GATE_LOCK)
+PASSCODE_SEAL_LOCK_S = 30.0     # store vs passcode set / change: wait this long for tokens/.passcode-seal.lock
 OSASCRIPT = "/usr/bin/osascript"
 SAME_USER_RISK = (
     "WARNING: iphone-setup creates a second Secure Enclave identity with NO biometry and encrypts copies of "
@@ -717,6 +718,37 @@ def open_passcode_copy(c, name, secret):
     finally:
         os.close(fd)
     return passcode_result(r.returncode, r.stdout, r.stderr, name)
+
+
+def seal_lock(wait=None):
+    """An fd holding the exclusive flock on tokens/.passcode-seal.lock, or None if it stayed busy for
+    `wait` s (default PASSCODE_SEAL_LOCK_S). `store` holds it while it replaces a token and drops the
+    stale passcode copy; `passcode set` / `change` while they seal, re-check and rename their copies, so
+    neither can slip between the other's check and rename. Non-blocking with a short retry. Raises
+    OSError when the lock file cannot be opened (e.g. it is a symlink)."""
+    os.makedirs(TOKENS_DIR, exist_ok=True)
+    fd = os.open(os.path.join(TOKENS_DIR, ".passcode-seal.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    end = time.time() + (PASSCODE_SEAL_LOCK_S if wait is None else wait)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() >= end:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
+
+
+def take_seal_lock(what):
+    """seal_lock() or die: `what` is the command that cannot run now."""
+    try:
+        fd = seal_lock()
+    except OSError as e:
+        die("%s: cannot lock %s: %s" % (what, os.path.join(TOKENS_DIR, ".passcode-seal.lock"), clean(e, 120)))
+    if fd is None:
+        die("%s: another store or passcode set/change is running; try again when it finishes" % what)
+    return fd
 
 
 def seal_passcode_copy(c, secret, token, name):
@@ -2568,16 +2600,20 @@ def cmd_store(argv):
     if not age:
         die("age not found (brew install age age-plugin-se)")
     dest = token_path(name)
-    err = encrypt_to(age, RECIPIENT, token, dest)
-    if err:
-        del token
-        die("age encrypt failed: " + err)
-    log({"op": "store", "result": "ok", "token": name})
-    print("stored token '%s' -> %s (decrypting it needs Touch ID)" % (name, dest))
-    if passcode_copy_names():   # sealing needs the passcode, which store never asks for
-        if os.path.lexists(passcode_token_path(name)):
-            os.remove(passcode_token_path(name))   # it held the previous token
-        print("no passcode copy for '%s' now: run bws-touchid passcode change to seal one" % name)
+    lock = take_seal_lock("store")   # a passcode set / change must not rename a copy of the old token after this
+    try:
+        err = encrypt_to(age, RECIPIENT, token, dest)
+        if err:
+            del token
+            die("age encrypt failed: " + err)
+        log({"op": "store", "result": "ok", "token": name})
+        print("stored token '%s' -> %s (decrypting it needs Touch ID)" % (name, dest))
+        if passcode_copy_names():   # sealing needs the passcode, which store never asks for
+            if os.path.lexists(passcode_token_path(name)):
+                os.remove(passcode_token_path(name))   # it held the previous token
+            print("no passcode copy for '%s' now: run bws-touchid passcode change to seal one" % name)
+    finally:
+        os.close(lock)
     if os.path.exists(RECIPIENT_IPHONE):  # already holding the plaintext: no extra prompt
         fps = bound_fps(load_config())   # keep the approvers already bound in the other copies
         err = encrypt_to(age, RECIPIENT_IPHONE, seal_iphone_payload(token, fps), iphone_token_path(name))
@@ -2989,7 +3025,7 @@ def passcode_set(c, sub):
         die("passcode %s needs a terminal (/dev/tty); nothing changed" % sub, 2)
     for d in (CONF_DIR, TOKENS_DIR):
         os.chmod(d, 0o700)
-    tokens, sealed, secret, seen = {}, [], None, {}
+    tokens, sealed, secret, seen, lock = {}, [], None, {}, None
     try:
         for name in names:
             print("Touch ID for token '%s'…" % name)
@@ -3012,32 +3048,39 @@ def passcode_set(c, sub):
         if not same:
             log({"op": "passcode-" + sub, "result": "rejected", "detail": "mismatch"})
             die("the two passcodes differ; nothing changed")
+        # From here to the renames a `store` must wait (and vice versa): seal, re-check, replace.
+        lock = take_seal_lock("passcode " + sub)
         for name in names:
             err = seal_passcode_copy(c, secret, tokens[name], name)
             if err:
-                for n in sealed:
-                    os.remove(passcode_token_path(n) + ".tmp")
                 die("age encrypt failed for '%s': %s; nothing changed" % (name, err))
             sealed.append(name)
+        tokens.clear()
+        zero(secret)
+        changed = [n for n in sealed if token_identity(n) != seen.get(n)]
+        if changed:   # `store` replaced a token meanwhile: these copies would hold the old one
+            log({"op": "passcode-" + sub, "result": "rejected", "token": changed[0], "detail": "token changed"})
+            die("token '%s' changed while sealing (bws-touchid store?); nothing changed, run passcode %s again"
+                % (changed[0], sub))
+        for name in sealed:
+            os.replace(passcode_token_path(name) + ".tmp", passcode_token_path(name))
+        for name in passcode_copy_names():
+            if name not in sealed:   # a copy of a token that no longer has a Touch ID copy
+                os.remove(passcode_token_path(name))
+    except BaseException:   # die(), Ctrl-C, a crash: no half-sealed *.passcode.age.tmp left behind
+        if lock is not None:   # .tmp files are only written under the lock: never touch another run's
+            for n in names:
+                try:
+                    os.remove(passcode_token_path(n) + ".tmp")
+                except OSError:
+                    pass
+        raise
     finally:
         tokens.clear()
         zero(secret)
-    changed = [n for n in sealed if token_identity(n) != seen.get(n)]
-    if changed:   # `store` replaced a token meanwhile: these copies would hold the old one
-        for n in sealed:
-            try:
-                os.remove(passcode_token_path(n) + ".tmp")
-            except OSError:
-                pass
-        log({"op": "passcode-" + sub, "result": "rejected", "token": changed[0], "detail": "token changed"})
-        die("token '%s' changed while sealing (bws-touchid store?); nothing changed, run passcode %s again"
-            % (changed[0], sub))
-    for name in sealed:
-        os.replace(passcode_token_path(name) + ".tmp", passcode_token_path(name))
+        if lock is not None:
+            os.close(lock)
     exclude_from_backups(c, [passcode_token_path(n) for n in sealed])
-    for name in passcode_copy_names():
-        if name not in sealed:   # a copy of a token that no longer has a Touch ID copy
-            os.remove(passcode_token_path(name))
     passcode_reset(create=True)
     log({"op": "passcode-" + sub, "result": "ok", "detail": "copies=" + ",".join(sealed)})
     print("passcode %s: sealed copies of %s (scrypt, tokens/<name>.passcode.age)" % (

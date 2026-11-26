@@ -4,7 +4,8 @@
 Copied into <sandbox>/bin/age; state lives in <sandbox>/state. Decrypt behaviour per leg (identity file
 basename identity.txt = "touchid", anything else = "iphone", `-j batchpass` = "passcode") comes from
 state/age.json:
-  {"touchid": {"mode": "ok|cancel|error|hang", "delay": 0.2, "until": "/path"}, "iphone": {...}, "passcode": {...}}
+  {"touchid": {"mode": "ok|cancel|error|hang", "delay": 0.2, "until": "/path"}, "iphone": {...}, "passcode": {...},
+   "passcode-encrypt": {"delay": 1, "until": "/path"}}   (encrypt: waits after writing the -o file)
 "until": do not answer before that file exists (the test releases the "sensor" when it is ready).
 Every run appends {"pid", "leg", "identity", "file", "mode"} to state/age.log.
 
@@ -67,7 +68,7 @@ def batchpass(args):
     secret = b"".join(chunks).rstrip(b"\r\n")   # like age-plugin-batchpass 1.3.2: every trailing CR/LF
     decrypt = "-d" in args
     leg = "passcode" if decrypt else "passcode-encrypt"
-    ctl = control("passcode") if decrypt else {}
+    ctl = control("passcode") if decrypt else control("passcode-encrypt")
     mode = ctl.get("mode", "ok")
     logline({"pid": os.getpid(), "leg": leg, "identity": "batchpass", "file": args[-1] if decrypt else opt(args, "-o"),
              "mode": mode, "argv": sys.argv, "env": dict(os.environ), "work_factor":
@@ -93,6 +94,7 @@ def batchpass(args):
     payload = sys.stdin.read()
     with open(out, "w") as f:
         f.write("FAKEAGE-SCRYPT\n%s\n%s\n%s" % (salt, hashlib.sha256(salt.encode() + secret).hexdigest(), payload))
+    wait_for(ctl)   # "passcode-encrypt": {"delay": s} keeps the run (and its finished -o file) around
 
 
 def main():

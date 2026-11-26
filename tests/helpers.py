@@ -157,10 +157,10 @@ class Sandbox(object):
         self.config = cfg
         self._write(os.path.join(self.conf, "config.json"), json.dumps(cfg))
 
-    def set_age(self, touchid=None, iphone=None, passcode=None):
+    def set_age(self, touchid=None, iphone=None, passcode=None, passcode_encrypt=None):
         self._write(os.path.join(self.state, "age.json"),
                     json.dumps({"touchid": touchid or {"mode": "ok", "delay": 0.1}, "iphone": iphone or {"mode": "ok"},
-                                "passcode": passcode or {"mode": "ok"}}))
+                                "passcode": passcode or {"mode": "ok"}, "passcode-encrypt": passcode_encrypt or {}}))
 
     def write_iphone_copies(self, legacy=False):
         """(Re)write tokens/<name>.iphone.age sealing FAKE_IPHONE_TOKENS with self.bound; legacy = the

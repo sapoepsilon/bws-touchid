@@ -26,10 +26,10 @@ WRONG = "Wr0ng-Guess-%d"
 TP = ["touchid", "passcode"]
 
 
-def run_pty(sb, args, answers, env=None, timeout=60, on_prompt=None):
+def run_pty(sb, args, answers, env=None, timeout=60, on_prompt=None, watch=None):
     """Run bws-touchid on a fresh pseudo-terminal that is its controlling tty, typing one answer per
-    getpass prompt (on_prompt(i) runs just before answer i is typed). Returns (exit code, all the
-    terminal showed)."""
+    getpass prompt (on_prompt(i) runs just before answer i is typed; watch(pid) on every 0.1 s tick).
+    Returns (exit code, all the terminal showed)."""
     pid, fd = pty.fork()
     if pid == 0:  # child
         try:
@@ -48,6 +48,8 @@ def run_pty(sb, args, answers, env=None, timeout=60, on_prompt=None):
             if not chunk:
                 break
             out += chunk
+        if watch:
+            watch(pid)
         prompts = out.count(b"hidden): ") + out.count(b"Repeat it: ")
         if pending and prompts > len(answers) - len(pending):
             if on_prompt:
@@ -779,6 +781,80 @@ class TestCliReviewFixes(Base):
         self.assertEqual(self.decrypt_copy("read", PASSCODE).returncode, 0, "old copy replaced")
         self.assertFalse([f for f in os.listdir(self.sb.tokens) if f.endswith(".tmp")])
 
+
+    def tmp_copies(self):
+        return [f for f in os.listdir(self.sb.tokens) if f.endswith(".passcode.age.tmp")]
+
+    def lock_busy(self):
+        fd = os.open(os.path.join(self.sb.tokens, ".passcode-seal.lock"), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+
+    def test_store_waits_for_a_running_set(self):
+        # item 5: a store that lands between set's identity check and its rename is serialised by the lock
+        self.sb.set_age(passcode_encrypt={"delay": 1.0})
+        res, seen = {}, {}
+
+        def run_set():
+            res["set"] = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE])
+        t = threading.Thread(target=run_set)
+        t.start()
+        end = time.time() + 30
+        while not self.tmp_copies() and time.time() < end:
+            time.sleep(0.02)
+        self.assertTrue(self.tmp_copies(), "set never started sealing")
+        seen["busy"] = self.lock_busy()
+        new_tok = "0.00000000-0000-0000-0000-000000000009.new:ZmFrZQ=="
+        r = self.sb.cli("bws-touchid", "store", "read", "--stdin", input=new_tok)
+        t.join(60)
+        code, out = res["set"]
+        self.assertTrue(seen["busy"], "set did not hold the seal lock while sealing")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no passcode copy for 'read' now", r.stdout, "store ran before set renamed its copies")
+        self.assertFalse(os.path.exists(os.path.join(self.sb.tokens, "read.passcode.age")),
+                         "a passcode copy of the replaced token survived")
+        self.assertEqual(self.decrypt_copy("write", PASSCODE).returncode, 0)
+        self.assertEqual(self.tmp_copies(), [])
+
+    def test_seal_lock_gives_up_when_busy(self):
+        mod = self.module()
+        mod.PASSCODE_SEAL_LOCK_S = 0.2
+        fd = mod.seal_lock()
+        self.assertIsNotNone(fd)
+        t0 = time.time()
+        try:
+            self.assertIsNone(mod.seal_lock())
+        finally:
+            os.close(fd)
+        self.assertLess(time.time() - t0, 1.5)
+        fd = mod.seal_lock()
+        self.assertIsNotNone(fd, "lock not free after release")
+        os.close(fd)
+        st = os.lstat(os.path.join(self.sb.tokens, ".passcode-seal.lock"))
+        self.assertEqual(st.st_mode & 0o777, 0o600)
+        self.assertEqual(mod.passcode_copy_names(), [])
+        self.assertEqual(mod.touchid_token_names(), ["read", "write"])
+
+    def test_interrupted_set_leaves_no_tmp_copies(self):
+        # item 6: Ctrl-C while sealing
+        self.sb.set_age(passcode_encrypt={"delay": 30})
+        sent = []
+
+        def interrupt(pid):
+            if not sent and self.tmp_copies():
+                os.kill(pid, signal.SIGINT)
+                sent.append(pid)
+        code, out = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE], watch=interrupt, timeout=40)
+        self.assertTrue(sent, out)
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual([f for f in os.listdir(self.sb.tokens) if ".passcode." in f], [], out)
+        self.assertEqual(self.procs_alive("age"), [], "the sealing age was left running")
 
 class TestFakeAgeNewlines(unittest.TestCase):
     """finding 8: fake batchpass strips trailing CR/LF the way the real age 1.3.2 plugin does (verified

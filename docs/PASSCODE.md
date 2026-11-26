@@ -46,7 +46,11 @@ read a passcode from a pipe, argv or env. `bws-touchid store NAME` cannot seal a
 for the passcode), so it deletes `NAME`'s stale copy and tells you to run `passcode change`. If a `store`
 replaces a token while `set` / `change` is running, `set` / `change` notices (inode, mtime and size of
 `tokens/NAME.age` differ from before its Touch ID decrypt), removes the copies it just sealed and stops with
-nothing changed.
+nothing changed. `store` and the seal / re-check / rename step of `set` / `change` also share a lock
+(`tokens/.passcode-seal.lock`, `flock`, non-blocking with a 30 s retry), so a `store` can never land between
+that check and the rename; whichever comes second waits (or gives up with "another store or passcode
+set/change is running"). An interrupted `set` / `change` (Ctrl-C, a crash, an error) removes its half-sealed
+`*.passcode.age.tmp` files.
 
 ## At approval time
 
