@@ -108,7 +108,8 @@ class Sandbox(object):
         for d in (self.home, self.bin, self.state):
             os.makedirs(d)
         for src, dst in (("fake_age.py", "age"), ("fake_bws.py", "bws"), ("fake_age_plugin_se.py", "age-plugin-se"),
-                         ("fake_age_plugin_batchpass.py", "age-plugin-batchpass"), ("fake_osascript.py", "osascript")):
+                         ("fake_age_plugin_batchpass.py", "age-plugin-batchpass"), ("fake_osascript.py", "osascript"),
+                         ("fake_tmutil.py", "tmutil")):
             p = os.path.join(self.bin, dst)
             shutil.copy(os.path.join(FAKES, src), p)
             os.chmod(p, 0o755)
@@ -138,6 +139,7 @@ class Sandbox(object):
                "age_plugin_se_path": os.path.join(self.bin, "age-plugin-se"),
                "age_plugin_batchpass_path": os.path.join(self.bin, "age-plugin-batchpass"),
                "osascript_path": os.path.join(self.bin, "osascript"),
+               "tmutil_path": os.path.join(self.bin, "tmutil"),
                "notify": False, "approvals_socket": self.sock}
         if approvers is not None:
             cfg["approvers"] = approvers

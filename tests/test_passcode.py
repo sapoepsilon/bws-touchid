@@ -26,9 +26,10 @@ WRONG = "Wr0ng-Guess-%d"
 TP = ["touchid", "passcode"]
 
 
-def run_pty(sb, args, answers, env=None, timeout=60):
+def run_pty(sb, args, answers, env=None, timeout=60, on_prompt=None):
     """Run bws-touchid on a fresh pseudo-terminal that is its controlling tty, typing one answer per
-    getpass prompt. Returns (exit code, all the terminal showed)."""
+    getpass prompt (on_prompt(i) runs just before answer i is typed). Returns (exit code, all the
+    terminal showed)."""
     pid, fd = pty.fork()
     if pid == 0:  # child
         try:
@@ -49,6 +50,8 @@ def run_pty(sb, args, answers, env=None, timeout=60):
             out += chunk
         prompts = out.count(b"hidden): ") + out.count(b"Repeat it: ")
         if pending and prompts > len(answers) - len(pending):
+            if on_prompt:
+                on_prompt(len(answers) - len(pending))
             os.write(fd, (pending.pop(0) + "\n").encode())
     else:
         os.kill(pid, signal.SIGKILL)
@@ -592,6 +595,72 @@ class TestReviewFixes(Base):
         mod.passcode_state = lambda: answers.pop(0) if answers else None
         mod.PASSCODE_BACKOFF_S = 60
         self.assertRegex(mod.passcode_summary(), r"set \(read, write\), 1/5 failed, next try in \d+s")
+
+
+class TestCliReviewFixes(Base):
+    def setUp(self):
+        Base.setUp(self)
+        for f in os.listdir(self.sb.tokens):
+            if ".passcode." in f:
+                os.remove(os.path.join(self.sb.tokens, f))
+
+    def tmutil_runs(self):
+        return self.sb.jsonl("tmutil.log")
+
+    def test_set_excludes_copies_from_time_machine(self):
+        # finding 3
+        code, out = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE])
+        self.assertEqual(code, 0, out)
+        runs = self.tmutil_runs()
+        self.assertEqual(sorted(r["argv"][1] for r in runs),
+                         sorted(os.path.join(self.sb.tokens, n + ".passcode.age") for n in ("read", "write")))
+        self.assertTrue(all(r["argv"][0] == "addexclusion" for r in runs))
+        new = "An0ther-Passc0de!"
+        code, out = run_pty(self.sb, ["passcode", "change"], [new, new])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.tmutil_runs()), 4, "change re-excludes the new files")
+
+    def test_tmutil_failure_only_warns(self):
+        self.sb._write(os.path.join(self.sb.state, "tmutil.json"), json.dumps({"mode": "error"}))
+        code, out = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE])
+        self.assertEqual(code, 0, out)
+        self.assertIn("warning: could not exclude", out)
+        self.assertTrue(os.path.exists(os.path.join(self.sb.tokens, "read.passcode.age")))
+
+    def test_no_tmutil_is_a_no_op(self):
+        self.sb.write_config(dict(self.sb.config, tmutil_path=os.path.join(self.sb.root, "no-such-tmutil")))
+        code, out = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("warning", out)
+
+    def test_store_during_set_aborts_and_removes_new_copies(self):
+        # finding 6: `store read` replaces tokens/read.age after set decrypted it with Touch ID
+        def store_now(i):
+            if i == 0:
+                p = os.path.join(self.sb.tokens, "read.age")
+                with open(p) as f:
+                    head = f.read().split("\n")[:2]
+                self.sb._write(p + ".tmp", "\n".join(head + ["0.00000000-0000-0000-0000-000000000009.new:ZmFrZQ=="]))
+                os.replace(p + ".tmp", p)
+        code, out = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE], on_prompt=store_now)
+        self.assertEqual(code, 1, out)
+        self.assertIn("token 'read' changed", out)
+        self.assertFalse([f for f in os.listdir(self.sb.tokens) if ".passcode." in f])
+        self.assertIn("op=passcode-set result=rejected token=read detail=token changed", "\n".join(self.sb.log_lines()))
+
+    def test_store_during_change_keeps_the_old_copies(self):
+        code, out = run_pty(self.sb, ["passcode", "set"], [PASSCODE, PASSCODE])
+        self.assertEqual(code, 0, out)
+
+        def touch(i):
+            if i == 1:
+                p = os.path.join(self.sb.tokens, "write.age")
+                os.utime(p, ns=(time.time_ns() + 5 * 10**9,) * 2)
+        new = "An0ther-Passc0de!"
+        code, out = run_pty(self.sb, ["passcode", "change"], [new, new], on_prompt=touch)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.decrypt_copy("read", PASSCODE).returncode, 0, "old copy replaced")
+        self.assertFalse([f for f in os.listdir(self.sb.tokens) if f.endswith(".tmp")])
 
 
 

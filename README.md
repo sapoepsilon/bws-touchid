@@ -138,6 +138,7 @@ hosts only `broker_name` and `local_broker` are used.
 | `approvers` | who may approve a gated op: `["touchid"]` (default, unchanged behaviour), `["touchid","iphone"]` (race), `["iphone"]` (lid-closed), and `"passcode"` in any mix (`["touchid","passcode"]`, `["touchid","iphone","passcode"]`, `["passcode"]`). Anything else refuses every save/read |
 | `age_plugin_batchpass_path` | passcode approver: `age-plugin-batchpass` (default: found on `PATH`; ships with age ≥ 1.3) |
 | `osascript_path` | passcode approver: the dialog program (default `/usr/bin/osascript`) |
+| `tmutil_path` | passcode approver: `tmutil` for the Time Machine exclusion of the passcode copies (default: found on PATH; absent = skipped) |
 | `approvals_socket` | the whispera-link daemon's socket (default `~/.whispera-link/approvals.sock`) |
 | `approvals_peer_paths` | optional list of executables allowed to serve `approvals_socket` (checked with `proc_pidpath`); empty = any process running as you |
 | `approvers_dir` | pinned iPhone approve keys, `<device_id>.pub` (default `~/.bws-broker/approvers`) |
