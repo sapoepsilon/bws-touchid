@@ -686,6 +686,34 @@ class TestRound2Gate(Base):
         self.assertEqual(self.sb.pc_state()["failures"], 0)
 
 
+    def test_dialog_that_cannot_exec_keeps_touchid(self):
+        # item 4: Popen raising OSError must end the passcode leg, not the whole gate
+        bad = os.path.join(self.sb.bin, "bad-osascript")
+        self.sb._write(bad, "#!/nonexistent/interpreter\n", 0o755)
+        self.sb.write_config(dict(self.sb.config, osascript_path=bad))
+        self.sb.set_age(touchid={"mode": "ok", "delay": 1.0})
+        r = self.handle(READ_REQ)
+        self.assertTrue(r["ok"], r)
+        self.assertIn("approver=touchid", self.last_log())
+        self.assertIn("passcode-unavailable:error", self.last_log())
+        self.assertEqual(self.sb.pc_state()["failures"], 0, "no attempt was made")
+
+    def test_pipe_failure_is_counted_and_keeps_touchid(self):
+        mod = self.module()
+
+        def no_fds(secret):
+            raise OSError(24, "Too many open files")
+        mod.passcode_pipe = no_fds
+        self.sb.set_age(touchid={"mode": "ok", "delay": 1.5})
+        r = self.handle(READ_REQ, mod)
+        self.assertTrue(r["ok"], r)
+        self.assertIn("approver=touchid", self.last_log())
+        self.assertIn("passcode-error:1", self.last_log())
+        self.assertIn("passcode-unavailable:error", self.last_log())
+        self.assertEqual(self.sb.pc_state()["failures"], 1, "the attempt was counted before the pipe")
+        self.assertIn("op=passcode result=error token=read detail=failures=1/5 via=dialog",
+                      "\n".join(self.sb.log_lines()))
+
 class TestCliReviewFixes(Base):
     def setUp(self):
         Base.setUp(self)

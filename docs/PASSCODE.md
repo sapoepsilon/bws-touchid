@@ -76,9 +76,10 @@ missing, the passcode is locked, or the backoff is longer than the window.
   settled by its real outcome instead (a right passcode still resets the count; its token is discarded).
 - A passcode submitted before the 120 s deadline is always verified: the request waits for that verify
   (at most 30 s) instead of killing it at the deadline, so a late answer is not wasted as `abandoned`.
-- A tool error (plugin crash, out of memory, missing plugin, a decrypt that takes over 30 s) is counted too,
-  but it ends the passcode leg (`passcode-unavailable:error`, log `result=error`) instead of re-prompting
-  "Wrong passcode".
+- A tool error (plugin crash, out of memory, missing plugin, a decrypt that takes over 30 s, no file
+  descriptors left for the passcode pipe) is counted too, but it ends the passcode leg
+  (`passcode-unavailable:error`, log `result=error`) instead of re-prompting "Wrong passcode". A dialog that
+  cannot be started ends the leg the same way, uncounted; Touch ID and the iPhone keep going.
 - The counter's `flock` is non-blocking with a 2 s retry. If another process holds it longer, the passcode
   leg is skipped as locked (`locked(state-busy)`); Touch ID and the iPhone still work.
 - Backoff after the n-th failure: 5 s · 4^(n−1) (5, 20, 80, 320 s).

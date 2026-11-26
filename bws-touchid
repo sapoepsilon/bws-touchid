@@ -1276,9 +1276,16 @@ class PasscodeLeg(Leg):
         for line in DIALOG_SCRIPT:
             argv += ["-e", line]
         argv += [text, "bws-touchid passcode", str(max(1, int(self.deadline - now)))]
-        self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     bufsize=0, env={"PATH": "/usr/bin:/bin", "HOME": HOME}, start_new_session=True)
+        try:
+            self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, bufsize=0, env={"PATH": "/usr/bin:/bin", "HOME": HOME},
+                                         start_new_session=True)
+        except OSError as e:   # fd exhaustion, a dialog program that cannot exec: end this leg, not the gate
+            self.proc = None
+            self.error = "passcode dialog failed: %s" % clean(e, 120)
+            return self._end("unavailable", "error")
         self.phase = "prompt"
+        return None
 
     def _end(self, kind, why):
         self.live = False
@@ -1308,8 +1315,7 @@ class PasscodeLeg(Leg):
                 return None
             if why:
                 return self._end("unavailable", why)
-            self._show(now)
-            return None
+            return self._show(now)
         if self.proc.poll() is None:
             if self.phase == "verify":   # bounded by verify_by, not the deadline: a passcode typed late still counts
                 if now < self.verify_by:
@@ -1351,8 +1357,7 @@ class PasscodeLeg(Leg):
             if not n or buf[0] != ord("P") or n == len(buf):
                 return self._end("unavailable", "dialog-error")
             if n == 1:                    # empty answer: no attempt, ask again
-                self._show(now)
-                return None
+                return self._show(now)
             failures, why = passcode_begin_attempt(now)
             if why:
                 return self._end("unavailable", why)
@@ -1360,6 +1365,11 @@ class PasscodeLeg(Leg):
             secret = buf[1:n]             # a bytearray slice: one copy, zeroed below
             try:
                 fd = passcode_pipe(secret)
+            except OSError as e:          # no fds left: counted (it already was), not a guess
+                self.error = "passcode decrypt failed: %s" % clean(e, 120)
+                passcode_failed(self.c, self.tname, failures, "error", "dialog")
+                self.notes.append("passcode-error:%s" % failures)
+                return self._end("unavailable", "error")
             finally:
                 zero(secret)
             try:
